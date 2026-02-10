@@ -5,62 +5,70 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import io
 
-# --- [1] 데이터 전처리 로직 ---
+# --- [1] 데이터 전처리 로직 (일반/Multi-layer 대응) ---
 def process_data(df, scale_factor, apply_iqr):
-    # 컬럼명 대문자 표준화 및 공백 제거
+    # 컬럼명 표준화 (대문자)
     df.columns = [c.strip().upper() for c in df.columns]
     
-    # 분석 대상 타겟 설정
+    # 1. 데이터 타입 판별
     if 'HEIGHT' in df.columns: d_type, target = "Height", "HEIGHT"
     elif 'RADIUS' in df.columns: d_type, target = "Radius", "RADIUS"
     elif 'SHIFT_NORM' in df.columns: d_type, target = "Shift", "SHIFT_NORM"
     elif 'X_COORD' in df.columns: d_type, target = "Coordinate", "X_COORD"
     else: return None, None
 
-    # 좌표 및 측정값 설정
-    df['X_VAL'] = (df['X_COORD'] if 'X_COORD' in df.columns else df['BUMP_CENTER_X']) * scale_factor
-    df['Y_VAL'] = (df['Y_COORD'] if 'Y_COORD' in df.columns else df['BUMP_CENTER_Y']) * scale_factor
+    # 2. 좌표 및 측정값 설정
+    # X_COORD가 있으면 우선 사용, 없으면 BUMP_CENTER_X 사용
+    df['X_VAL'] = (df['X_COORD'] if 'X_COORD' in df.columns else df.get('BUMP_CENTER_X', 0)) * scale_factor
+    df['Y_VAL'] = (df['Y_COORD'] if 'Y_COORD' in df.columns else df.get('BUMP_CENTER_Y', 0)) * scale_factor
     df['MEAS_VALUE'] = df[target] * scale_factor
     
-    # 레이어 및 Pillar ID 설정 (Pillar_Number, Layer_number 대응)
-    df['L_NUM'] = (df['LAYER_NUMBER'] if 'LAYER_NUMBER' in df.columns else (df['LAYER'] if 'LAYER' in df.columns else 0)).astype(int)
-    df['P_ID'] = df['PILLAR_NUMBER'] if 'PILLAR_NUMBER' in df.columns else (df['GROUP_ID'] if 'GROUP_ID' in df.columns else df.index)
+    # 3. 레이어 번호 설정 (Pillar 데이터인 경우 LAYER_NUMBER 우선)
+    if 'LAYER_NUMBER' in df.columns:
+        df['L_NUM'] = df['LAYER_NUMBER'].astype(int)
+    elif 'BUMP_CENTER_Z' in df.columns:
+        z_vals = np.sort(df['BUMP_CENTER_Z'].unique())
+        if len(z_vals) > 1:
+            z_diffs = np.diff(z_vals)
+            gap = max((z_vals.max() - z_vals.min()) * 0.1, 0.05)
+            splits = z_vals[1:][z_diffs > gap]
+            l_assign = np.ones(len(df), dtype=int)
+            for p in splits: l_assign[df['BUMP_CENTER_Z'] >= p] += 1
+            df['L_NUM'] = l_assign
+        else:
+            df['L_NUM'] = 0 # 일반 데이터는 0 혹은 1로 시작
+    else:
+        df['L_NUM'] = 0
 
-    # IQR 필터링 (Coordinate 타입 제외)
+    # 4. Pillar 식별자 (Shift 분석용)
+    if 'PILLAR_NUMBER' in df.columns: df['P_ID'] = df['PILLAR_NUMBER']
+    elif 'GROUP_ID' in df.columns: df['P_ID'] = df['GROUP_ID']
+    else: df['P_ID'] = None
+
+    # 5. IQR 필터링 (측정값이 좌표가 아닐 때만 적용)
     df_clean = df.copy()
     if apply_iqr and d_type != "Coordinate":
         df_clean = df_clean[df_clean['MEAS_VALUE'] != 0]
-        q1, q3 = df_clean['MEAS_VALUE'].quantile([0.25, 0.75])
-        iqr = q3 - q1
-        df_clean = df_clean[(df_clean['MEAS_VALUE'] >= q1 - 1.5 * iqr) & (df_clean['MEAS_VALUE'] <= q3 + 1.5 * iqr)]
+        if not df_clean.empty:
+            q1, q3 = df_clean['MEAS_VALUE'].quantile([0.25, 0.75])
+            iqr = q3 - q1
+            df_clean = df_clean[(df_clean['MEAS_VALUE'] >= q1 - 1.5 * iqr) & (df_clean['MEAS_VALUE'] <= q3 + 1.5 * iqr)]
 
     return df_clean, d_type
 
 # --- [2] UI 구성 ---
-st.set_page_config(page_title="NLX Multi-Layer Alignment Expert", layout="wide")
-st.title("🔬 NLX Bump Analysis Dashboard (Final Version)")
+st.set_page_config(page_title="NLX Bump Expert", layout="wide")
+st.title("🔬 NLX Bump Analysis Dashboard")
 
-# 사이드바 설정
-st.sidebar.header("📁 Configuration")
+st.sidebar.header("📁 Data Setting")
 uploaded_files = st.sidebar.file_uploader("Upload CSV Files", type=['csv'], accept_multiple_files=True)
 scale = st.sidebar.number_input("Global Scale Factor", value=1000)
 use_iqr = st.sidebar.checkbox("Apply IQR Filter", value=True)
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("📐 Plot Size Settings")
+# 그래프 크기 및 라벨 설정
 p_w = st.sidebar.slider("Plot Width", 5, 25, 10)
 p_h = st.sidebar.slider("Plot Height", 3, 15, 8)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("🎨 Plot Customization")
-custom_title = st.sidebar.text_input("Graph Title", "Alignment Trend Analysis")
-custom_x_label = st.sidebar.text_input("X-axis Label (Shift)", "Average Shift Value (um)")
-custom_y_label = st.sidebar.text_input("Y-axis Label (Layer)", "Layer Number")
-
-st.sidebar.subheader("📏 Scale Settings")
-use_custom_scale = st.sidebar.checkbox("Apply Custom Scale Range")
-v_min = st.sidebar.number_input("Min (Left/Bottom)", value=-10.0)
-v_max = st.sidebar.number_input("Max (Right/Top)", value=10.0)
+custom_title = st.sidebar.text_input("Graph Title", "Alignment Analysis")
 
 if uploaded_files:
     all_data = []
@@ -77,7 +85,6 @@ if uploaded_files:
         
         tab1, tab2, tab3 = st.tabs(["📊 Single Layer View", "📈 Layer Comparison", "📉 Multi-Layer Shift Trend"])
 
-        # Tab 1: 단일 층 시각화
         with tab1:
             selected_layer = st.selectbox("Select Layer", ["All Layers"] + [f"Layer {i}" for i in unique_layers])
             display_df = combined_df if selected_layer == "All Layers" else combined_df[combined_df['L_NUM'] == int(selected_layer.split(" ")[1])]
@@ -86,71 +93,51 @@ if uploaded_files:
             sc = ax1.scatter(display_df['X_VAL'], display_df['Y_VAL'], c=display_df['MEAS_VALUE'], cmap='jet', s=15)
             plt.colorbar(sc, label=f"{d_type} Value")
             ax1.set_title(f"{custom_title} ({selected_layer})")
-            ax1.set_xlabel("X (um)"); ax1.set_ylabel("Y (um)")
             st.pyplot(fig1)
 
-        # Tab 2: 층별 비교 (Boxplot)
         with tab2:
             if len(unique_layers) > 1:
                 fig2, ax2 = plt.subplots(figsize=(p_w, p_h))
                 sns.boxplot(data=combined_df, x='L_NUM', y='MEAS_VALUE', hue='SOURCE_FILE', ax=ax2)
-                ax2.set_title(f"Comparison: {custom_title}")
-                if use_custom_scale: ax2.set_ylim(v_min, v_max)
                 st.pyplot(fig2)
-                
-                stats = combined_df.groupby(['SOURCE_FILE', 'L_NUM'])['MEAS_VALUE'].agg(['mean', 'std', 'count']).reset_index()
-                st.dataframe(stats)
+                st.dataframe(combined_df.groupby(['SOURCE_FILE', 'L_NUM'])['MEAS_VALUE'].agg(['mean', 'std', 'count']))
             else:
-                st.info("Layer 비교를 위해 2개 이상의 층이 필요합니다.")
+                st.info("비교를 위해 2개 이상의 레이어가 필요합니다.")
 
-        # Tab 3: 핵심 요청 로직 - Layer 0 기준 Pillar 평균 변위 분석
+        # --- Tab 3: Multi-Layer Shift (로직 충돌 방지 적용) ---
         with tab3:
-            if len(unique_layers) > 1:
-                st.subheader("Multi-Layer Relative Shift Trend (Reference: Layer 0)")
-                
+            # P_ID(Pillar)가 있는 데이터만 분석 수행
+            shift_capable_df = combined_df.dropna(subset=['P_ID'])
+            
+            if not shift_capable_df.empty and len(unique_layers) > 1:
+                st.subheader("Pillar-wise Shift Trend (Ref: Layer 0)")
                 trend_list = []
-                for src in combined_df['SOURCE_FILE'].unique():
-                    src_df = combined_df[combined_df['SOURCE_FILE'] == src]
-                    
-                    # Layer 0 데이터를 각 Pillar의 기준(Ref)으로 추출
+                for src in shift_capable_df['SOURCE_FILE'].unique():
+                    src_df = shift_capable_df[shift_capable_df['SOURCE_FILE'] == src]
                     base = src_df[src_df['L_NUM'] == 0][['P_ID', 'X_VAL', 'Y_VAL']]
                     
-                    if base.empty:
-                        st.warning(f"File '{src}' does not contain Layer 0 data.")
-                        continue
-
-                    for lyr in unique_layers:
-                        # 해당 층의 Pillar 좌표 추출
-                        target = src_df[src_df['L_NUM'] == lyr][['P_ID', 'X_VAL', 'Y_VAL']]
-                        # Pillar ID를 매개체로 1:1 매칭 (Merge)
-                        merged = pd.merge(base, target, on='P_ID', suffixes=('_REF', '_TGT'))
-                        
-                        if not merged.empty:
-                            # 1층 좌표 대비 변위 계산
-                            merged['DX'] = merged['X_VAL_TGT'] - merged['X_VAL_REF']
-                            merged['DY'] = merged['Y_VAL_TGT'] - merged['Y_VAL_REF']
-                            
-                            # 모든 Pillar의 평균값 도출
-                            trend_list.append({
-                                'Source': src, 'Layer': lyr, 
-                                'Avg_DX': merged['DX'].mean(), 'Avg_DY': merged['DY'].mean()
-                            })
+                    if not base.empty:
+                        for lyr in unique_layers:
+                            target = src_df[src_df['L_NUM'] == lyr][['P_ID', 'X_VAL', 'Y_VAL']]
+                            merged = pd.merge(base, target, on='P_ID', suffixes=('_REF', '_TGT'))
+                            if not merged.empty:
+                                dx = (merged['X_VAL_TGT'] - merged['X_VAL_REF']).mean()
+                                dy = (merged['Y_VAL_TGT'] - merged['Y_VAL_REF']).mean()
+                                trend_list.append({'Source': src, 'Layer': lyr, 'Avg_DX': dx, 'Avg_DY': dy})
                 
                 if trend_list:
                     trend_df = pd.DataFrame(trend_list)
                     fig3, ax3 = plt.subplots(figsize=(p_w, p_h))
-                    
                     for src in trend_df['Source'].unique():
                         data = trend_df[trend_df['Source'] == src]
-                        ax3.plot(data['Avg_DX'], data['Layer'], marker='o', label=f"{src} (X Avg)")
-                        ax3.plot(data['Avg_DY'], data['Layer'], marker='s', ls='--', label=f"{src} (Y Avg)")
-                    
+                        ax3.plot(data['Avg_DX'], data['Layer'], marker='o', label=f"{src} (X)")
+                        ax3.plot(data['Avg_DY'], data['Layer'], marker='s', ls='--', label=f"{src} (Y)")
                     ax3.axvline(0, color='black', alpha=0.3)
                     ax3.set_yticks(unique_layers)
-                    ax3.set_xlabel(custom_x_label); ax3.set_ylabel(custom_y_label)
-                    ax3.set_title(f"{custom_title}: Vertical Alignment Trend")
-                    if use_custom_scale: ax3.set_xlim(v_min, v_max)
+                    ax3.set_xlabel("Average Shift (um)"); ax3.set_ylabel("Layer")
                     ax3.legend()
                     st.pyplot(fig3)
-                    st.dataframe(trend_df)
-                    st.download_button("📥 Download Trend Data (CSV)", trend_df.to_csv(index=False).encode('utf-8'), "alignment_trend.csv")
+                else:
+                    st.warning("Layer 0를 포함한 Pillar 데이터가 부족합니다.")
+            else:
+                st.info("Pillar 기반 Shift 분석을 위해 Coordinate 데이터가 필요합니다.")
