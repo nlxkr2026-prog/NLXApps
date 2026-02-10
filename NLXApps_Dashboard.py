@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+from scipy.interpolate import griddata
 import io
 
 # --- [1] 데이터 전처리 로직 (Z-Gap 0번부터 할당 및 대소문자 표준화) ---
@@ -32,7 +33,8 @@ def process_data(df, scale_factor, apply_iqr):
             gap = max((z_vals.max() - z_vals.min()) * 0.1, 0.05)
             splits = z_vals[1:][z_diffs > gap]
             l_assign = np.zeros(len(df), dtype=int)
-            for p in splits: l_assign[df['BUMP_CENTER_Z'] >= p] += 1
+            for p in splits:
+                l_assign[df['BUMP_CENTER_Z'] >= p] += 1
             df['L_NUM'] = l_assign
         else:
             df['L_NUM'] = 0
@@ -53,6 +55,24 @@ def process_data(df, scale_factor, apply_iqr):
 
     return df_clean, d_type
 
+# --- [Helper] Contour Plot 함수 ---
+def plot_heatmap_core(ax, x, y, z, title, x_lab, y_lab, vmin=None, vmax=None, cmap='jet'):
+    if len(x) < 5: # 그리드 생성에 필요한 최소 데이터
+        sc = ax.scatter(x, y, c=z, cmap=cmap, s=20)
+        if vmin is not None: sc.set_clim(vmin, vmax)
+        return sc
+    
+    # 그리드 생성
+    xi = np.linspace(x.min(), x.max(), 100)
+    yi = np.linspace(y.min(), y.max(), 100)
+    xi, yi = np.meshgrid(xi, yi)
+    zi = griddata((x, y), z, (xi, yi), method='linear')
+    
+    cp = ax.contourf(xi, yi, zi, levels=15, cmap=cmap, vmin=vmin, vmax=vmax, extend='both')
+    ax.set_title(title)
+    ax.set_xlabel(x_lab); ax.set_ylabel(y_lab)
+    return cp
+
 # --- [2] UI 구성 ---
 st.set_page_config(page_title="NLX Multi-Layer Professional", layout="wide")
 st.title("🔬 NLX Bump Analysis Dashboard (Ref: Layer 0)")
@@ -69,8 +89,7 @@ p_h = st.sidebar.slider("Plot Height", 3, 15, 7)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🎨 Plot Customization")
-custom_title = st.sidebar.text_input("Graph Title", "Alignment Analysis")
-# [복구] Legend 이름 지정 기능
+custom_title = st.sidebar.text_input("Graph Title", "Analysis Result")
 custom_x_legend = st.sidebar.text_input("X-axis Legend Name", "X Position (um)")
 custom_y_legend = st.sidebar.text_input("Y-axis Legend Name", "Y Position (um)")
 
@@ -102,18 +121,21 @@ if uploaded_files:
             fig1, ax1 = plt.subplots(figsize=(p_w, p_h))
             
             if chart_type == "Heatmap":
-                sc = ax1.scatter(display_df['X_VAL'], display_df['Y_VAL'], c=display_df['MEAS_VALUE'], cmap='jet', s=15)
-                if use_custom_scale: sc.set_clim(v_min, v_max)
-                plt.colorbar(sc, label=f"{d_type} Value")
+                if d_type == "Coordinate": st.caption("Info: Coordinate file detected. Heatmap shows Raw X-Coordinate values.")
+                cp = plot_heatmap_core(ax1, display_df['X_VAL'], display_df['Y_VAL'], display_df['MEAS_VALUE'], 
+                                      f"{custom_title} ({selected_layer})", custom_x_legend, custom_y_legend,
+                                      vmin=v_min if use_custom_scale else None, vmax=v_max if use_custom_scale else None)
+                plt.colorbar(cp, ax=ax1, label=f"{d_type} Value")
             elif chart_type == "Box Plot":
                 sns.boxplot(data=display_df, x='SOURCE_FILE', y='MEAS_VALUE', ax=ax1)
                 if use_custom_scale: ax1.set_ylim(v_min, v_max)
+                ax1.set_xlabel("Source Files"); ax1.set_ylabel(f"{d_type} Value")
             elif chart_type == "Histogram":
                 sns.histplot(data=display_df, x='MEAS_VALUE', hue='SOURCE_FILE', kde=True, ax=ax1)
                 if use_custom_scale: ax1.set_xlim(v_min, v_max)
+                ax1.set_xlabel(f"{d_type} Value")
             
             ax1.set_title(f"{custom_title} ({selected_layer})")
-            ax1.set_xlabel(custom_x_legend); ax1.set_ylabel(custom_y_legend)
             st.pyplot(fig1)
 
         with tab2:
@@ -124,20 +146,19 @@ if uploaded_files:
                 ax2.set_title(f"Layer Comparison: {custom_title}")
                 ax2.set_xlabel("Layer Number"); ax2.set_ylabel(f"{d_type} Value")
                 st.pyplot(fig2)
+            else:
+                st.info("비교 분석을 위해 2층 이상의 데이터가 필요합니다.")
 
         with tab3:
             shift_df = combined_df.dropna(subset=['P_ID'])
             if not shift_df.empty and len(unique_layers) > 1:
                 st.subheader("Inter-Layer Alignment & Shift Magnitude Heatmap")
                 
-                # 1. Shift 데이터 재가공
                 trend_list = []
                 heatmap_data_list = []
-                
                 for src in shift_df['SOURCE_FILE'].unique():
                     src_df = shift_df[shift_df['SOURCE_FILE'] == src]
                     base = src_df[src_df['L_NUM'] == 0][['P_ID', 'X_VAL', 'Y_VAL']]
-                    
                     if not base.empty:
                         for lyr in unique_layers:
                             target = src_df[src_df['L_NUM'] == lyr][['P_ID', 'X_VAL', 'Y_VAL']]
@@ -146,16 +167,11 @@ if uploaded_files:
                                 merged['DX'] = merged['X_VAL_TGT'] - merged['X_VAL_REF']
                                 merged['DY'] = merged['Y_VAL_TGT'] - merged['Y_VAL_REF']
                                 merged['MAG'] = np.sqrt(merged['DX']**2 + merged['DY']**2)
-                                
-                                # 트렌드용 평균값
                                 trend_list.append({'Source': src, 'Layer': lyr, 'DX': merged['DX'].mean(), 'DY': merged['DY'].mean()})
-                                # Heatmap용 상세 데이터
-                                merged['Layer'] = lyr
-                                merged['Source'] = src
+                                merged['Layer'] = lyr; merged['Source'] = src
                                 heatmap_data_list.append(merged)
 
                 if trend_list:
-                    # (1) Trend Line Chart
                     trend_df = pd.DataFrame(trend_list)
                     fig3, ax3 = plt.subplots(figsize=(p_w, p_h))
                     for src in trend_df['Source'].unique():
@@ -169,21 +185,23 @@ if uploaded_files:
                     ax3.legend()
                     st.pyplot(fig3)
                     
-                    # (2) [신규] Shift Magnitude Heatmap
                     st.markdown("---")
-                    st.subheader("Shift Magnitude Map (Relative to Layer 0)")
-                    h_layer = st.selectbox("Select Layer for Heatmap", unique_layers[1:])
+                    st.subheader("Shift Intensity Map (Magnitude vs Position)")
+                    c1, c2 = st.columns(2)
+                    with c1: h_layer = st.selectbox("Select Layer to Heat", unique_layers[1:])
+                    with c2: h_type = st.radio("Value to Visualize", ["Magnitude", "Delta X", "Delta Y"], horizontal=True)
+                    
                     h_df_all = pd.concat(heatmap_data_list)
                     h_df = h_df_all[h_df_all['Layer'] == h_layer]
+                    h_target = {"Magnitude": "MAG", "Delta X": "DX", "Delta Y": "DY"}[h_type]
                     
                     fig4, ax4 = plt.subplots(figsize=(p_w, p_h))
-                    # Layer 0에서의 원래 위치(X_VAL_REF)에 틀어진 정도(MAG)를 표시
-                    sc_h = ax4.scatter(h_df['X_VAL_REF'], h_df['Y_VAL_REF'], c=h_df['MAG'], cmap='Reds', s=20)
-                    plt.colorbar(sc_h, label="Shift Magnitude (um)")
-                    ax4.set_title(f"Layer {h_layer} Shift Intensity Map")
-                    ax4.set_xlabel(custom_x_legend); ax4.set_ylabel(custom_y_legend)
+                    cp_h = plot_heatmap_core(ax4, h_df['X_VAL_REF'], h_df['Y_VAL_REF'], h_df[h_target],
+                                           f"Layer {h_layer} {h_type} Map", custom_x_legend, custom_y_legend,
+                                           cmap='Reds' if h_type=="Magnitude" else 'RdBu_r')
+                    plt.colorbar(cp_h, label=f"{h_type} (um)")
                     st.pyplot(fig4)
                     
-                    st.download_button("📥 Export Trend CSV", trend_df.to_csv(index=False).encode('utf-8'), "alignment_trend.csv")
+                    st.download_button("📥 Export Trend CSV", trend_df.to_csv(index=False).encode('utf-8'), "shift_trend.csv")
             else:
-                st.info("Pillar/Coordinate 데이터와 Layer 0가 필요합니다.")
+                st.info("Shift 분석을 위해 Pillar 기반의 Coordinate 데이터와 Layer 0가 필요합니다.")
