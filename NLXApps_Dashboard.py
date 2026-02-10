@@ -3,11 +3,9 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.cluster import DBSCAN
 
-# --- [1] 데이터 전처리 및 DBSCAN 레이어 분석 로직 ---
+# --- [1] 데이터 전처리 및 스마트 레이어 분석 로직 ---
 def process_data(df, scale_factor, apply_iqr):
-    # 컬럼 공백 제거
     df.columns = [c.strip() for c in df.columns]
     
     # 1. 데이터 타입 판별
@@ -16,52 +14,51 @@ def process_data(df, scale_factor, apply_iqr):
     elif 'Shift_Norm' in df.columns: d_type, target = "Shift", "Shift_Norm"
     else: return None, None
 
-    # 2. 기본 단위 변환 및 X, Y 좌표 설정
+    # 2. 기본 단위 변환
     df['X'] = df['Bump_Center_X'] * scale_factor
     df['Y'] = df['Bump_Center_Y'] * scale_factor
     df['Value'] = df[target] * scale_factor
     
-    # 3. 이상치 제거 (Value 기준)
+    # 3. 이상치 제거 (Value)
     df_clean = df[df['Value'] != 0].copy()
     if apply_iqr:
         q1, q3 = df_clean['Value'].quantile([0.25, 0.75])
         iqr = q3 - q1
         df_clean = df_clean[(df_clean['Value'] >= q1 - 1.5 * iqr) & (df_clean['Value'] <= q3 + 1.5 * iqr)]
 
-    # 4. [개선] DBSCAN을 이용한 자동 레이어 분석
-    # Z값이 0에서 175로 뛰든, 미세하게 차이나든 데이터가 모여있는 그룹을 찾습니다.
+    # 4. [개선] 거시적 레이어 분석 (Z-Gap Detection)
+    # 미세한 차이는 무시하고, 0 -> 175 -> 349 같은 거대한 점프만 찾아냅니다.
     if 'Bump_Center_Z' in df_clean.columns and df_clean['Bump_Center_Z'].nunique() > 1:
-        z_data = df_clean[['Bump_Center_Z']].values
+        z_vals = np.sort(df_clean['Bump_Center_Z'].unique())
+        z_diffs = np.diff(z_vals)
         
-        # eps: 같은 층으로 묶을 최대 Z축 거리 (0.01mm = 10um 정도면 한 층으로 묶기에 충분)
-        # min_samples: 한 층을 구성할 최소 데이터 개수
-        dbscan = DBSCAN(eps=0.01, min_samples=5)
-        df_clean['Layer_Label'] = dbscan.fit_predict(z_data)
+        # 전체 Z 범위의 10% 이상이거나, 최소 50 단위 이상 차이나는 곳을 경계로 설정
+        z_range = z_vals.max() - z_vals.min()
+        gap_threshold = max(z_range * 0.1, 50.0) 
         
-        # 노이즈(-1)를 제외하고 Z값 평균이 낮은 순서대로 Layer 1, 2, 3... 부여
-        valid_data = df_clean[df_clean['Layer_Label'] != -1]
-        if not valid_data.empty:
-            layer_order = valid_data.groupby('Layer_Label')['Bump_Center_Z'].mean().sort_values().index
-            layer_map = {old: new + 1 for new, old in enumerate(layer_order)}
-            df_clean['Layer'] = df_clean['Layer_Label'].map(layer_map).fillna(0).astype(int)
-        else:
-            df_clean['Layer'] = 1
+        # 경계 지점(Split Points) 찾기
+        split_points = z_vals[1:][z_diffs > gap_threshold]
+        
+        # 레이어 할당 (1부터 시작)
+        layer_assignment = np.ones(len(df_clean), dtype=int)
+        for p in split_points:
+            layer_assignment[df_clean['Bump_Center_Z'] >= p] += 1
+        df_clean['Layer'] = layer_assignment
     else:
-        # Z 데이터가 없는 경우 (Shift 데이터 등) 단일층 처리
         df_clean['Layer'] = 1
 
     return df_clean, d_type
 
-# --- [2] Streamlit UI 구성 ---
-st.set_page_config(page_title="NLX DBSCAN Analyzer", layout="wide")
-st.title("🔬 NLX Bump Analysis Dashboard (DBSCAN Layering)")
+# --- [2] UI 구성 ---
+st.set_page_config(page_title="NLX Advanced Dashboard", layout="wide")
+st.title("🔬 NLX Bump Analysis Dashboard (Macro Layering)")
 
 # 사이드바 설정
 st.sidebar.header("📁 Configuration")
 uploaded_files = st.sidebar.file_uploader("Upload CSV Files", type=['csv'], accept_multiple_files=True)
-scale = st.sidebar.number_input("Global Scale Factor (mm to um = 1000)", value=1000)
+scale = st.sidebar.number_input("Global Scale Factor", value=1000)
 
-# 그래프 커스터마이징 섹션
+# [추가] 그래프 커스터마이징 섹션
 st.sidebar.markdown("---")
 st.sidebar.subheader("🎨 Plot Customization")
 custom_title = st.sidebar.text_input("Graph Title", "Analysis Result")
@@ -86,7 +83,7 @@ if uploaded_files:
         combined_df = pd.concat(all_data)
         
         # 레이어 선택 (1번부터 표시)
-        unique_layers = sorted([l for l in combined_df['Layer'].unique() if l > 0])
+        unique_layers = sorted(combined_df['Layer'].unique())
         selected_layer = st.sidebar.selectbox("Select Layer", ["All Layers"] + [f"Layer {i}" for i in unique_layers])
 
         # 필터링 적용
@@ -96,17 +93,16 @@ if uploaded_files:
         else:
             display_df = combined_df
 
-        # --- 메인 시각화 영역 ---
-        st.subheader(f"📊 {d_type} Visual Report ({selected_layer})")
-        chart_type = st.radio("Chart Type", ["Heatmap", "Box Plot", "Distribution"], horizontal=True)
+        # --- 메인 그래프 영역 ---
+        st.subheader(f"📊 {d_type} Visual Analysis ({selected_layer})")
+        chart_type = st.radio("Select View", ["Heatmap", "Box Plot", "Distribution"], horizontal=True)
         
         fig, ax = plt.subplots(figsize=(10, 6))
 
-        # 모든 그래프에 공통 설정 적용 로직
+        # 모든 그래프에 타이틀/라벨/스케일 적용
         if chart_type == "Heatmap":
             vm_min = v_min if use_custom_scale else display_df['Value'].min()
             vm_max = v_max if use_custom_scale else display_df['Value'].max()
-            
             sc = ax.scatter(display_df['X'], display_df['Y'], c=display_df['Value'], 
                             cmap='jet', s=15, vmin=vm_min, vmax=vm_max)
             plt.colorbar(sc, label=f"{d_type} Value")
@@ -124,15 +120,12 @@ if uploaded_files:
             ax.set_xlabel(f"{d_type} Value")
             if use_custom_scale: ax.set_xlim(v_min, v_max)
 
-        # 전체 그래프 제목 적용
+        # 전체 공통 제목 적용
         ax.set_title(custom_title)
         st.pyplot(fig)
 
-        # 요약 통계 정보
+        # 요약 통계 테이블
         st.markdown("---")
-        st.subheader("📋 Summary Statistics")
+        st.subheader(f"📋 Summary Statistics ({selected_layer})")
         summary_df = display_df.groupby('Source')['Value'].agg(['mean', 'std', 'min', 'max', 'count']).reset_index()
         st.dataframe(summary_df, use_container_width=True)
-
-else:
-    st.info("💡 사이드바에서 CSV 파일을 업로드하여 분석을 시작하세요.")
