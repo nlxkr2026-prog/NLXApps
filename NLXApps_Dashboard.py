@@ -11,16 +11,32 @@ def process_data(df, scale_factor, apply_iqr):
     df.columns = [c.strip().upper() for c in df.columns]
     
     # 1. 데이터 타입 판별 및 타겟 설정
-    if 'HEIGHT' in df.columns: d_type, target = "Height", "HEIGHT"
-    elif 'RADIUS' in df.columns: d_type, target = "Radius", "RADIUS"
-    elif 'SHIFT_NORM' in df.columns: d_type, target = "Shift", "SHIFT_NORM"
-    elif 'X_COORD' in df.columns: d_type, target = "Coordinate", "X_COORD"
+    d_type = None
+    target_cols = []
+    
+    if 'HEIGHT' in df.columns: 
+        d_type, target_cols = "Height", ['HEIGHT']
+    elif 'RADIUS' in df.columns: 
+        d_type, target_cols = "Radius", ['RADIUS']
+    elif 'SHIFT_NORM' in df.columns or 'SHIFT_X' in df.columns: 
+        d_type = "Shift"
+        if 'SHIFT_NORM' in df.columns: target_cols.append('SHIFT_NORM')
+        if 'SHIFT_X' in df.columns: target_cols.append('SHIFT_X')
+        if 'SHIFT_Y' in df.columns: target_cols.append('SHIFT_Y')
+    elif 'X_COORD' in df.columns: 
+        d_type, target_cols = "Coordinate", ['X_COORD']
     else: return None, None
 
     # 2. 좌표 및 측정값 설정
     df['X_VAL'] = (df['X_COORD'] if 'X_COORD' in df.columns else df.get('BUMP_CENTER_X', 0)) * scale_factor
     df['Y_VAL'] = (df['Y_COORD'] if 'Y_COORD' in df.columns else df.get('BUMP_CENTER_Y', 0)) * scale_factor
-    df['MEAS_VALUE'] = df[target] * scale_factor
+    
+    # 모든 가용 측정 컬럼에 스케일 적용
+    for col in target_cols:
+        df[col + '_UM'] = df[col] * scale_factor
+    
+    # 기본 메인 값 설정
+    df['MEAS_VALUE'] = df[target_cols[0] + '_UM']
     
     # 3. 레이어 번호 설정 (0번부터 시작)
     if 'LAYER_NUMBER' in df.columns:
@@ -70,7 +86,6 @@ p_h = st.sidebar.slider("Plot Height", 3, 15, 7)
 st.sidebar.markdown("---")
 st.sidebar.subheader("🎨 Plot Customization")
 custom_title = st.sidebar.text_input("Graph Title", "Alignment Analysis")
-# [복구] Legend 이름 지정 기능
 custom_x_legend = st.sidebar.text_input("X-axis Legend Name", "X Position (um)")
 custom_y_legend = st.sidebar.text_input("Y-axis Legend Name", "Y Position (um)")
 
@@ -95,26 +110,43 @@ if uploaded_files:
         tab1, tab2, tab3 = st.tabs(["📊 Single Layer View", "📈 Layer Comparison", "📉 Multi-Layer Shift Trend"])
 
         with tab1:
-            selected_layer = st.selectbox("Select Layer", ["All Layers"] + [f"Layer {i}" for i in unique_layers])
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                selected_layer = st.selectbox("Select Layer", ["All Layers"] + [f"Layer {i}" for i in unique_layers])
+            
             display_df = combined_df if selected_layer == "All Layers" else combined_df[combined_df['L_NUM'] == int(selected_layer.split(" ")[1])]
             
+            # Shift 데이터일 경우 가용 컬럼 선택 UI
+            active_target = 'MEAS_VALUE'
+            if d_type == "Shift":
+                avail_cols = [c for c in display_df.columns if c.endswith('_UM')]
+                with c2:
+                    active_target = st.selectbox("Select Target Data", avail_cols, index=0)
+
             chart_type = st.radio("Chart Type", ["Heatmap", "Box Plot", "Histogram"], horizontal=True)
             fig1, ax1 = plt.subplots(figsize=(p_w, p_h))
             
             if chart_type == "Heatmap":
-                sc = ax1.scatter(display_df['X_VAL'], display_df['Y_VAL'], c=display_df['MEAS_VALUE'], cmap='jet', s=15)
+                sc = ax1.scatter(display_df['X_VAL'], display_df['Y_VAL'], c=display_df[active_target], cmap='jet', s=15)
                 if use_custom_scale: sc.set_clim(v_min, v_max)
-                plt.colorbar(sc, label=f"{d_type} Value")
+                plt.colorbar(sc, label=f"Value (um)")
             elif chart_type == "Box Plot":
-                sns.boxplot(data=display_df, x='SOURCE_FILE', y='MEAS_VALUE', ax=ax1)
+                sns.boxplot(data=display_df, x='SOURCE_FILE', y=active_target, ax=ax1)
                 if use_custom_scale: ax1.set_ylim(v_min, v_max)
             elif chart_type == "Histogram":
-                sns.histplot(data=display_df, x='MEAS_VALUE', hue='SOURCE_FILE', kde=True, ax=ax1)
+                sns.histplot(data=display_df, x=active_target, hue='SOURCE_FILE', kde=True, ax=ax1)
                 if use_custom_scale: ax1.set_xlim(v_min, v_max)
             
-            ax1.set_title(f"{custom_title} ({selected_layer})")
+            ax1.set_title(f"{custom_title} ({selected_layer}) - {active_target}")
             ax1.set_xlabel(custom_x_legend); ax1.set_ylabel(custom_y_legend)
             st.pyplot(fig1)
+
+            # [신규] 통계 요약 테이블 출력
+            st.markdown("---")
+            st.subheader(f"📊 Summary Statistics ({selected_layer})")
+            summary = display_df.groupby('SOURCE_FILE')[active_target].agg(['mean', 'std', 'min', 'max', 'count']).reset_index()
+            summary['3-Sigma'] = summary['std'] * 3
+            st.dataframe(summary.style.highlight_max(axis=0, subset=['mean', '3-Sigma']))
 
         with tab2:
             if len(unique_layers) > 1:
@@ -130,7 +162,6 @@ if uploaded_files:
             if not shift_df.empty and len(unique_layers) > 1:
                 st.subheader("Inter-Layer Alignment & Shift Magnitude Heatmap")
                 
-                # 1. Shift 데이터 재가공
                 trend_list = []
                 heatmap_data_list = []
                 
@@ -147,15 +178,11 @@ if uploaded_files:
                                 merged['DY'] = merged['Y_VAL_TGT'] - merged['Y_VAL_REF']
                                 merged['MAG'] = np.sqrt(merged['DX']**2 + merged['DY']**2)
                                 
-                                # 트렌드용 평균값
                                 trend_list.append({'Source': src, 'Layer': lyr, 'DX': merged['DX'].mean(), 'DY': merged['DY'].mean()})
-                                # Heatmap용 상세 데이터
-                                merged['Layer'] = lyr
-                                merged['Source'] = src
+                                merged['Layer'] = lyr; merged['Source'] = src
                                 heatmap_data_list.append(merged)
 
                 if trend_list:
-                    # (1) Trend Line Chart
                     trend_df = pd.DataFrame(trend_list)
                     fig3, ax3 = plt.subplots(figsize=(p_w, p_h))
                     for src in trend_df['Source'].unique():
@@ -169,7 +196,6 @@ if uploaded_files:
                     ax3.legend()
                     st.pyplot(fig3)
                     
-                    # (2) [신규] Shift Magnitude Heatmap
                     st.markdown("---")
                     st.subheader("Shift Magnitude Map (Relative to Layer 0)")
                     h_layer = st.selectbox("Select Layer for Heatmap", unique_layers[1:])
@@ -177,7 +203,6 @@ if uploaded_files:
                     h_df = h_df_all[h_df_all['Layer'] == h_layer]
                     
                     fig4, ax4 = plt.subplots(figsize=(p_w, p_h))
-                    # Layer 0에서의 원래 위치(X_VAL_REF)에 틀어진 정도(MAG)를 표시
                     sc_h = ax4.scatter(h_df['X_VAL_REF'], h_df['Y_VAL_REF'], c=h_df['MAG'], cmap='Reds', s=20)
                     plt.colorbar(sc_h, label="Shift Magnitude (um)")
                     ax4.set_title(f"Layer {h_layer} Shift Intensity Map")
