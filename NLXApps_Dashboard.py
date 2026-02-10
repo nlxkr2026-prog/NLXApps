@@ -71,11 +71,11 @@ def process_data(df, scale_factor, apply_iqr):
 
 # --- [2] UI 구성 ---
 st.set_page_config(page_title="NLX Multi-Layer Professional", layout="wide")
-st.title("🔬 NLX Bump Analysis Dashboard (Ref: Layer 0)")
+st.title("🔬 NLX Bump Analysis Dashboard")
 
 st.sidebar.header("📁 Configuration")
 uploaded_files = st.sidebar.file_uploader("Upload CSV Files", type=['csv'], accept_multiple_files=True)
-scale = st.sidebar.number_input("Global Scale Factor", value=1000)
+scale = st.sidebar.number_input("Global Scale Factor", value=1)
 use_iqr = st.sidebar.checkbox("Apply IQR Filter", value=True)
 
 st.sidebar.markdown("---")
@@ -164,7 +164,7 @@ if uploaded_files:
                 st.dataframe(c_stats)
                 st.download_button("📥 Export Comparison Stats CSV", c_stats.to_csv(index=False).encode('utf-8'), "layer_stats.csv")
             else:
-                st.info("비교를 위해서는 2층 이상의 레이어가 필요합니다.")
+                st.info("For comparison, need 2 more layers")
 
         with tab3:
             shift_df = combined_df.dropna(subset=['P_ID'])
@@ -224,4 +224,4 @@ if uploaded_files:
                     ax4.set_xlabel(custom_x_legend); ax4.set_ylabel(custom_y_legend)
                     st.pyplot(fig4)
             else:
-                st.info("Pillar/Coordinate 데이터와 Layer 0가 필요합니다.")
+                st.info("Pillar/Coordinate data and need layer 0")
