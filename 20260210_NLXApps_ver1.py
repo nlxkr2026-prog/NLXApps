@@ -5,6 +5,29 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import io
 
+"""
+NLX Multi-Layer Analysis Dashboard - Version 1.0 (Stable)
+Date: 2026-02-10
+Author: ZEISS Inline X-ray Application Engineering Team
+
+Description:
+    This dashboard provides a comprehensive analysis for semiconductor bumps using ZEISS NLX data.
+    It supports Height, Radius, and Shift data analysis with a focus on multi-layer alignment.
+
+Key Features:
+    1. Single Layer View: Visualizes individual layer data using Heatmaps, Boxplots, and Dot Distributions.
+    2. Layer Comparison: Cross-layer statistical analysis and boxplot comparisons.
+    3. Multi-Layer Shift Trend: Calculates relative shifts (Delta X, Delta Y, Magnitude) 
+       using Pillar/Group_ID matching, referenced to Layer 0.
+    4. Smart Layer Detection: Automatically segments layers using a Z-Gap algorithm for raw Z-coordinate data.
+    5. Customization: Full control over plot dimensions, axis legends, and color scales.
+
+Data Requirements:
+    - Input: CSV files containing Pillar_Number (or Group_ID), Layer_number (or Bump_Center_Z), 
+      and measurement coordinates (X_Coord, Y_Coord).
+    - Unit: Supports micron-level analysis (Global Scale Factor adjustment available).
+"""
+
 # --- [1] 데이터 전처리 로직 (Z-Gap 0번부터 할당 및 대소문자 표준화) ---
 def process_data(df, scale_factor, apply_iqr):
     # 컬럼명 대문자 표준화
