@@ -8,7 +8,7 @@ from io import BytesIO
 
 # --- 1. 페이지 설정 ---
 st.set_page_config(page_title="Bump Master Analyzer Pro", layout="wide")
-st.title("🔬 Universal Bump Quality Analyzer (Export Enabled)")
+st.title("🔬 Universal Bump Quality Analyzer (v.Final_Fixed)")
 
 # --- 2. 사이드바 설정 ---
 st.sidebar.header("⚙️ 분석 및 시각화 설정")
@@ -114,34 +114,26 @@ if uploaded_files:
         total_df = pd.concat(final_processed_list, ignore_index=True)
         plot_config = {'editable': True, 'displaylogo': False}
 
-        # --- [추가] 5. 데이터 Export 기능 ---
+        # --- 5. 데이터 Export 기능 ---
         st.subheader("📁 Data Export")
         m_list = [c for c in ['Radius', 'Height', 'Pitch_X', 'Pitch_Y', 'Shift_X', 'Shift_Y', 'Shift_Norm'] if c in total_df.columns]
         
-        # 통계 요약표 생성
-        summary_by_layer = total_df.groupby(['File_Name', 'Inferred_Layer'])[m_list].agg(['mean', 'std', 'min', 'max', 'count']).round(3)
+        summary_by_layer = total_df.groupby(['File_Name', 'Inferred_Layer'])[m_list].agg(['mean', 'std', 'count']).round(3)
         summary_total = total_df.groupby(['File_Name'])[m_list].agg(['mean', 'std', 'count']).round(3)
 
-        # Excel 파일 생성 (BytesIO)
         output = BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
             summary_by_layer.to_excel(writer, sheet_name='Layer_Statistics')
             summary_total.to_excel(writer, sheet_name='Total_Statistics')
-            # 상세 데이터도 포함 (필요시)
             total_df.to_excel(writer, sheet_name='Raw_Data_Cleaned', index=False)
         
-        st.download_button(
-            label="📥 Download Statistics as Excel",
-            data=output.getvalue(),
-            file_name="Bump_Quality_Report.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        st.download_button(label="📥 Download Excel Report", data=output.getvalue(), file_name="Bump_Quality_Report.xlsx", mime="application/vnd.ms-excel")
 
         st.divider()
         st.subheader("📊 Summary Preview")
         st.dataframe(summary_by_layer, use_container_width=True)
 
-        # --- 탭 구성 (Tab 1, 2, 3 동일) ---
+        # --- 탭 구성 ---
         tab1, tab2, tab3 = st.tabs(["📏 Group A (Shape)", "🎯 Group B (Shift)", "🌐 3D View"])
 
         with tab1:
@@ -178,13 +170,14 @@ if uploaded_files:
                 v_d = pdf_b[(pdf_b['File_Name'] == v_f) & pdf_b['Shift_X'].notna()]
                 if not v_d.empty:
                     xc, yc = ('Bump_Center_X', 'Bump_Center_Y') if 'Bump_Center_X' in v_d.columns else ('X_Coord', 'Y_Coord')
-                    fig_v = ff.create_quiver(x=v_d[xc], y=v_d[yc], u=v_d['Shift_X']*vector_scale, v=v_df['Shift_Y']*vector_scale if 'v_df' in locals() else v_d['Shift_Y']*vector_scale, scale=1, arrow_scale=0.2, line=dict(color='red', width=1))
+                    fig_v = ff.create_quiver(x=v_d[xc], y=v_d[yc], u=v_d['Shift_X']*vector_scale, v=v_d['Shift_Y']*vector_scale, scale=1, arrow_scale=0.2, line=dict(color='red', width=1))
                     fig_v.add_trace(go.Scatter(x=v_d[xc], y=v_d[yc], mode='markers', marker=dict(size=3, color='blue', opacity=0.3), name='Bump Center'))
                     fig_v.update_layout(height=800, yaxis=dict(scaleanchor="x", scaleratio=1))
                     st.plotly_chart(fig_v, use_container_width=True, config=plot_config)
 
         with tab3:
             st.header("🌐 3D Structural View")
+            # 3D 통합 데이터 생성
             if m_key != "Independent Analysis":
                 pivot_df = total_df.groupby(['Group_ID', 'Inferred_Layer']).first().reset_index()
                 df3 = pivot_df.merge(master_coords, on='Group_ID', how='left')
@@ -200,16 +193,32 @@ if uploaded_files:
             if avail_3d:
                 c_3 = st.selectbox("3D 색상 지표", avail_3d)
                 df3 = df3.dropna(subset=[c_3])
+                
+                # [수정] Threshold 로직 변수 이름 통일 (l_th -> lth)
                 apply_th = st.checkbox("⚠️ Threshold Highlight Mode", value=False)
                 if apply_th:
                     cx, cy = st.columns(2)
-                    hth = cx.number_input("High (Red)", value=float(df3[c_3].max()))
-                    lth = cy.number_input("Low (Yellow)", value=float(df3[c_3].min()))
-                    df3['Color'] = df3[c_3].apply(lambda v: 'Critical' if v >= hth else ('Warning' if v <= l_th else 'Normal'))
-                    fig3 = px.scatter_3d(df3, x=x3, y=y3, z=z3, color='Color', color_discrete_map={'Critical': 'red', 'Warning': 'yellow', 'Normal': 'lightgray'})
+                    hth = cx.number_input("High Threshold (Red Above)", value=float(df3[c_3].max()))
+                    lth = cy.number_input("Low Threshold (Yellow Below)", value=float(df3[c_3].min()))
+                    
+                    # 상태 할당 함수 (변수 이름 오타 수정 완료)
+                    def get_status(v):
+                        if v >= hth: return 'Critical (Red)'
+                        elif v <= lth: return 'Warning (Yellow)'
+                        else: return 'Normal'
+                    
+                    df3['Color_Status'] = df3[c_3].apply(get_status)
+                    
+                    fig3 = px.scatter_3d(
+                        df3, x=x3, y=y3, z=z3, 
+                        color='Color_Status',
+                        color_discrete_map={'Critical (Red)': 'red', 'Warning (Yellow)': 'yellow', 'Normal': 'lightgray'},
+                        opacity=0.8
+                    )
                 else:
-                    fig3 = px.scatter_3d(df3, x=x3, y=y3, z=z3, color=c_3, color_continuous_scale='Turbo')
-                fig3.update_layout(scene=dict(aspectmode='data'), height=800)
+                    fig3 = px.scatter_3d(df3, x=x3, y=y3, z=z3, color=c_3, color_continuous_scale='Turbo', opacity=0.8)
+                
+                fig3.update_layout(scene=dict(aspectmode='data'), height=800, title=f"3D Map: {c_3} (Editable)")
                 st.plotly_chart(fig3, use_container_width=True, config=plot_config)
 else:
-    st.info("파일을 업로드하면 보고서 생성 및 분석이 가능합니다.")
+    st.info("파일을 업로드하면 분석 대시보드가 활성화됩니다.")
