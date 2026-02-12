@@ -44,35 +44,33 @@ def process_data(df, scale_factor, apply_iqr, pitch_sensitivity):
         else: df['L_NUM'] = 0
     else: df['L_NUM'] = 0
 
-    # 4. [정밀 Pitch 알고리즘]
+    # 4. 정밀 Pitch 알고리즘 (ID 연속성 + 평균 기반 1.5배 필터)
     df['P_ID'] = df['GROUP_ID'] if 'GROUP_ID' in df.columns else df.index
     group_base = ['SOURCE_FILE', 'L_NUM'] if 'SOURCE_FILE' in df.columns else ['L_NUM']
     grid_size = 0.5 
 
-    # X_Pitch 계산 (Y 그리드 기준)
+    # X_Pitch: 동일 행(Y_GRID) 내 계산
     df['Y_GRID'] = (df['Y_VAL'] / grid_size).round() * grid_size
     df = df.sort_values(by=group_base + ['Y_GRID', 'X_VAL'])
     df['ID_DIFF'] = df.groupby(group_base + ['Y_GRID'])['P_ID'].diff()
-    # [제안 반영] ID가 1 차이가 아니면(Missing 발생 지점) Pitch 계산 제외
-    df['X_PITCH'] = np.where(df['ID_DIFF'] == 1, df.groupby(group_base + ['Y_GRID'])['X_VAL'].diff().abs(), np.nan)
+    df['X_P_RAW'] = np.where(df['ID_DIFF'] == 1, df.groupby(group_base + ['Y_GRID'])['X_VAL'].diff().abs(), np.nan)
 
-    # Y_Pitch 계산 (X 그리드 기준)
+    # Y_Pitch: 동일 열(X_GRID) 내 계산
     df['X_GRID'] = (df['X_VAL'] / grid_size).round() * grid_size
     df = df.sort_values(by=group_base + ['X_GRID', 'Y_VAL'])
-    # Y축은 ID가 불규칙할 수 있으므로 먼저 Raw 계산 후 통계 필터 적용
     df['Y_P_RAW'] = df.groupby(group_base + ['X_GRID'])['Y_VAL'].diff().abs()
 
-    # [제안 반영] Pitch 통계 필터 (평균 기반 1.5배 이상/이하 제거)
-    for col in ['X_PITCH', 'Y_P_RAW']:
+    # 평균 대비 1.5배 이상 필터링 (Missing Bump에 의한 배수 Pitch 제거)
+    for col in ['X_P_RAW', 'Y_P_RAW']:
         valid_data = df[col].dropna()
         if not valid_data.empty:
             avg_p = valid_data.mean()
-            # 평균의 1.5배 초과(Missing 배수) 혹은 0.5배 미만(노이즈) 제거
             df[col] = np.where((df[col] > avg_p * 1.5) | (df[col] < avg_p * 0.5), np.nan, df[col])
     
+    df['X_PITCH'] = df['X_P_RAW']
     df['Y_PITCH'] = df['Y_P_RAW']
 
-    # Pitch 전용 IQR 필터 (마지막 정제)
+    # Pitch 전용 IQR 필터
     for col in ['X_PITCH', 'Y_PITCH']:
         valid_p = df[col].dropna()
         if not valid_p.empty:
@@ -102,7 +100,7 @@ def apply_global_legend(ax, loc, show_legend):
         if handles: ax.legend(handles=handles, labels=labels, loc=loc, title=None)
 
 # --- [2] UI 구성 ---
-st.set_page_config(page_title="NLX Multi-Layer Professional", layout="wide")
+st.set_page_config(page_title="NLX Professional Dashboard", layout="wide")
 st.title("🔬 NLX Bump Analysis Dashboard")
 
 with st.sidebar:
@@ -113,7 +111,6 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("🎯 Pitch Filter Settings")
-    # Pitch 필터 강도 조절 (기본 1.2로 타이트하게 설정)
     pitch_sensitivity = st.slider("Pitch Outlier Sensitivity", 0.5, 3.0, 1.2, 0.1)
 
     with st.expander("🎨 Plot Settings", expanded=True):
@@ -130,11 +127,16 @@ with st.sidebar:
         v_min = st.number_input("Min Limit", value=-10.0)
         v_max = st.number_input("Max Limit", value=10.0)
 
+    with st.expander("🧊 3D View Settings", expanded=False):
+        color_option = st.selectbox("Color Theme", ["Viridis", "Plasma", "Jet", "Turbo"])
+        use_outlier_filter = st.checkbox("Highlight Outliers in 3D")
+        outlier_low = st.number_input("3D Lower Bound (Yellow)", value=-5.0)
+        outlier_high = st.number_input("3D Upper Bound (Red)", value=5.0)
+
 if uploaded_files:
     all_data = []
     for file in uploaded_files:
         raw_df = pd.read_csv(file)
-        # pitch_sensitivity 파라미터 전달
         p_df, d_type = process_data(raw_df, scale, use_iqr, pitch_sensitivity)
         if p_df is not None:
             p_df['SOURCE_FILE'] = os.path.splitext(file.name)[0]
@@ -154,6 +156,7 @@ if uploaded_files:
         st.markdown("---")
         tabs = st.tabs(["📊 Single Layer", "📈 Comparison", "📉 Shift Trend", "🧊 3D View", "🎯 Pitch Analysis"])
 
+        # 1. Single Layer Tab
         with tabs[0]:
             sel_layer = st.selectbox("Select Layer", ["All Layers"] + [f"Layer {i}" for i in unique_layers])
             disp_df = combined_df if sel_layer == "All Layers" else combined_df[combined_df['L_NUM'] == int(sel_layer.split(" ")[1])]
@@ -161,28 +164,76 @@ if uploaded_files:
             sns.histplot(data=disp_df, x='MEAS_VALUE', hue='SOURCE_FILE', kde=True, ax=ax1)
             if use_custom_scale: ax1.set_xlim(v_min, v_max)
             apply_global_legend(ax1, global_legend_loc, show_legend)
+            ax1.set_title(custom_title); ax1.set_xlabel(x_lbl); ax1.set_ylabel(y_lbl)
             st.pyplot(fig1)
 
+        # 2. Comparison Tab
+        with tabs[1]:
+            if len(unique_layers) > 1:
+                fig2, ax2 = plt.subplots(figsize=(p_w, p_h))
+                sns.boxplot(data=combined_df, x='L_NUM', y='MEAS_VALUE', hue='SOURCE_FILE', ax=ax2)
+                if use_custom_scale: ax2.set_ylim(v_min, v_max)
+                apply_global_legend(ax2, global_legend_loc, show_legend)
+                ax2.set_title("Layer-wise Comparison"); st.pyplot(fig2)
+            else: st.info("Requires more than one layer for comparison.")
+
+        # 3. Shift Trend Tab
+        with tabs[2]:
+            shift_df = combined_df.dropna(subset=['P_ID'])
+            if not shift_df.empty and len(unique_layers) > 1:
+                trend_list = []
+                for src in shift_df['SOURCE_FILE'].unique():
+                    src_df = shift_df[shift_df['SOURCE_FILE'] == src]
+                    base = src_df[src_df['L_NUM'] == 0][['P_ID', 'X_VAL', 'Y_VAL']]
+                    if not base.empty:
+                        for lyr in unique_layers:
+                            target = src_df[src_df['L_NUM'] == lyr][['P_ID', 'X_VAL', 'Y_VAL']]
+                            merged = pd.merge(base, target, on='P_ID', suffixes=('_REF', '_TGT'))
+                            if not merged.empty:
+                                trend_list.append({'Source': src, 'Layer': lyr, 
+                                                   'Avg_DX': (merged['X_VAL_TGT'] - merged['X_VAL_REF']).mean(), 
+                                                   'Avg_DY': (merged['Y_VAL_TGT'] - merged['Y_VAL_REF']).mean()})
+                if trend_list:
+                    trend_df = pd.DataFrame(trend_list)
+                    fig3, ax3 = plt.subplots(figsize=(p_w, p_h))
+                    for src in trend_df['Source'].unique():
+                        data = trend_df[trend_df['Source'] == src]
+                        ax3.plot(data['Avg_DX'], data['Layer'], marker='o', label=f"{src} (X)")
+                        ax3.plot(data['Avg_DY'], data['Layer'], marker='s', ls='--', label=f"{src} (Y)")
+                    if use_custom_scale: ax3.set_xlim(v_min, v_max)
+                    ax3.set_title("Shift Trend Analysis"); apply_global_legend(ax3, global_legend_loc, show_legend)
+                    st.pyplot(fig3)
+
+        # 4. 3D View Tab
+        with tabs[3]:
+            st.subheader("Interactive 3D Layer Stack View")
+            plot_3d_df = combined_df.copy()
+            if use_outlier_filter:
+                conditions = [(plot_3d_df['MEAS_VALUE'] < outlier_low), (plot_3d_df['MEAS_VALUE'] > outlier_high)]
+                choices = ['Under Limit (Yellow)', 'Over Limit (Red)']
+                plot_3d_df['Status'] = np.select(conditions, choices, default='Normal')
+                fig_3d = px.scatter_3d(plot_3d_df, x='X_VAL', y='Y_VAL', z='L_NUM', color='Status',
+                                     color_discrete_map={'Under Limit (Yellow)': 'yellow', 'Over Limit (Red)': 'red', 'Normal': 'blue'},
+                                     opacity=0.6)
+            else:
+                fig_3d = px.scatter_3d(plot_3d_df, x='X_VAL', y='Y_VAL', z='L_NUM', color='MEAS_VALUE', color_continuous_scale=color_option.lower())
+            fig_3d.update_layout(height=700); st.plotly_chart(fig_3d, use_container_width=True)
+
+        # 5. Pitch Analysis Tab
         with tabs[4]:
-            st.subheader("🎯 Pitch Distribution Analysis")
-            sel_layer_p = st.selectbox("Select Layer for Pitch", ["All Layers"] + [f"Layer {i}" for i in unique_layers], key="pitch_tab_layer")
-            pitch_df = combined_df if sel_layer_p == "All Layers" else combined_df[combined_df['L_NUM'] == int(sel_layer_p.split(" ")[1])]
+            st.subheader("🎯 Pitch Analysis (X & Y Distribution)")
+            sel_layer_p = st.selectbox("Select Layer for Pitch Analysis", ["All Layers"] + [f"Layer {i}" for i in unique_layers], key="p_tab_sel")
+            p_df = combined_df if sel_layer_p == "All Layers" else combined_df[combined_df['L_NUM'] == int(sel_layer_p.split(" ")[1])]
             
             col_p1, col_p2 = st.columns(2)
             for col, p_type, p_color in zip([col_p1, col_p2], ['X_PITCH', 'Y_PITCH'], ['Blues', 'Reds']):
                 with col:
                     st.markdown(f"**{p_type} Analysis**")
                     fig_p, ax_p = plt.subplots(figsize=(p_w/2, p_h))
-                    sns.boxplot(data=pitch_df, x='SOURCE_FILE', y=p_type, hue='SOURCE_FILE', ax=ax_p, palette=p_color)
+                    sns.boxplot(data=p_df, x='SOURCE_FILE', y=p_type, hue='SOURCE_FILE', ax=ax_p, palette=p_color)
                     apply_global_legend(ax_p, global_legend_loc, show_legend); st.pyplot(fig_p)
-                    
                     fig_h, ax_h = plt.subplots(figsize=(p_w/2, p_h))
-                    sns.histplot(data=pitch_df, x=p_type, hue='SOURCE_FILE', kde=True, ax=ax_h)
+                    sns.histplot(data=p_df, x=p_type, hue='SOURCE_FILE', kde=True, ax=ax_h)
                     apply_global_legend(ax_h, global_legend_loc, show_legend); st.pyplot(fig_h)
-            
-            st.markdown("**Pitch Stats Summary**")
-            st.dataframe(pitch_df.groupby('SOURCE_FILE')[['X_PITCH', 'Y_PITCH']].mean().style.format("{:.3f}"), use_container_width=True)
-
 else:
     st.info("Please upload CSV files.")
-    
