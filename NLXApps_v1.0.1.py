@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-import plotly.express as px  # 3D 시각화용
 import io
 import os
 
@@ -63,16 +62,21 @@ def process_data(df, scale_factor, apply_iqr):
 
     return df_clean, d_type
 
-# --- 범례 관리 함수 ---
+# --- 범례 및 제목 관리 함수 ---
 def apply_global_legend(ax, loc, show_legend):
     if not show_legend:
         leg = ax.get_legend()
         if leg: leg.remove()
         return
+
     try:
         sns.move_legend(ax, loc=loc, title=None)
     except:
         handles, labels = ax.get_legend_handles_labels()
+        if not handles and hasattr(ax, 'legend_') and ax.legend_ is not None:
+            handles = ax.legend_.legend_handles if hasattr(ax.legend_, 'legend_handles') else ax.legend_.legendHandles
+            labels = [t.get_text() for t in ax.legend_.get_texts()]
+        
         if handles:
             ax.legend(handles=handles, labels=labels, loc=loc, title=None)
 
@@ -87,12 +91,14 @@ use_iqr = st.sidebar.checkbox("Apply IQR Filter", value=True)
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("📐 Plot Size Settings")
+# [수정 1] Width, Height 대신 배율(Scale)로 조절
 p_multiplier = st.sidebar.slider("Plot Scale (Multiplier)", 0.5, 3.0, 1.0, 0.1)
 p_w = 10 * p_multiplier
-p_h = 6 * p_multiplier
+p_h = 7 * p_multiplier
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🎨 Legend & Text Settings")
+# [수정 3] 사용자 지정 제목만 사용하기 위해 기본값 최적화
 custom_title = st.sidebar.text_input("Graph Title", "Alignment Analysis")
 custom_x_legend = st.sidebar.text_input("X-axis Legend Name", "X Position (um)")
 custom_y_legend = st.sidebar.text_input("Y-axis Legend Name", "Y Position (um)")
@@ -105,45 +111,26 @@ global_legend_loc = st.sidebar.selectbox(
     disabled=not show_legend
 )
 
+st.sidebar.subheader("📏 Scale Settings")
+use_custom_scale = st.sidebar.checkbox("Apply Custom Scale Range")
+v_min = st.sidebar.number_input("Min Limit", value=-10.0)
+v_max = st.sidebar.number_input("Max Limit", value=10.0)
+
 if uploaded_files:
     all_data = []
     for file in uploaded_files:
         raw_df = pd.read_csv(file)
         p_df, d_type = process_data(raw_df, scale, use_iqr)
         if p_df is not None:
+            # [수정 2] 파일명에서 확장자 제거하여 저장
             p_df['SOURCE_FILE'] = os.path.splitext(file.name)[0]
             all_data.append(p_df)
 
     if all_data:
         combined_df = pd.concat(all_data)
         unique_layers = sorted(combined_df['L_NUM'].unique())
-
-        # --- [기능 1] Summary Dashboard (상단 메트릭 및 파일별 통계) ---
-        st.markdown("### 📋 Quick Summary")
-        m_col1, m_col2, m_col3, m_col4 = st.columns(4)
-        avg_val = combined_df['MEAS_VALUE'].mean()
-        std_val = combined_df['MEAS_VALUE'].std()
-        count_val = len(combined_df)
         
-        m_col1.metric("Global Average", f"{avg_val:.3f} um")
-        m_col2.metric("Global 3-Sigma", f"{(std_val * 3):.3f} um")
-        m_col3.metric("Global Max-Min", f"{(combined_df['MEAS_VALUE'].max() - combined_df['MEAS_VALUE'].min()):.3f} um")
-        m_col4.metric("Total Bumps", f"{count_val:,}")
-
-        # [신규 추가] 파일별 상세 통계 테이블
-        with st.expander("📄 View File-wise Detailed Statistics", expanded=True):
-            file_stats = combined_df.groupby('SOURCE_FILE')['MEAS_VALUE'].agg(['mean', 'std', 'min', 'max', 'count']).reset_index()
-            file_stats['3-Sigma'] = file_stats['std'] * 3
-            file_stats.columns = ['File Name', 'Average (um)', 'Std Dev', 'Min', 'Max', 'Count', '3-Sigma (um)']
-            # 주요 지표 순서 재배치
-            file_stats = file_stats[['File Name', 'Average (um)', '3-Sigma (um)', 'Min', 'Max', 'Count']]
-            st.dataframe(file_stats.style.format(subset=['Average (um)', '3-Sigma (um)', 'Min', 'Max'], formatter="{:.3f}"), use_container_width=True)
-        
-        st.markdown("---")
-
-        tab1, tab2, tab3, tab4 = st.tabs([
-            "📊 Single Layer", "📈 Comparison", "📉 Shift Trend", "🧊 3D View"
-        ])
+        tab1, tab2, tab3 = st.tabs(["📊 Single Layer View", "📈 Layer Comparison", "📉 Multi-Layer Shift Trend"])
 
         with tab1:
             c1, c2 = st.columns([1, 1])
@@ -151,77 +138,116 @@ if uploaded_files:
                 selected_layer = st.selectbox("Select Layer", ["All Layers"] + [f"Layer {i}" for i in unique_layers])
             
             display_df = combined_df if selected_layer == "All Layers" else combined_df[combined_df['L_NUM'] == int(selected_layer.split(" ")[1])]
+            
             active_target = 'MEAS_VALUE'
             if d_type == "Shift":
                 avail_cols = [c for c in display_df.columns if c.endswith('_UM')]
-                with c2: active_target = st.selectbox("Select Target Data", avail_cols, index=0)
+                with c2:
+                    active_target = st.selectbox("Select Target Data", avail_cols, index=0)
 
             chart_type = st.radio("Chart Type", ["Heatmap", "Box Plot", "Histogram"], horizontal=True)
             fig1, ax1 = plt.subplots(figsize=(p_w, p_h))
             
             if chart_type == "Heatmap":
                 sc = ax1.scatter(display_df['X_VAL'], display_df['Y_VAL'], c=display_df[active_target], cmap='jet', s=15)
+                if use_custom_scale: sc.set_clim(v_min, v_max)
                 plt.colorbar(sc, label=f"Value (um)")
             elif chart_type == "Box Plot":
                 sns.boxplot(data=display_df, x='SOURCE_FILE', y=active_target, hue='SOURCE_FILE', ax=ax1, palette='Set2')
                 apply_global_legend(ax1, global_legend_loc, show_legend)
+                if use_custom_scale: ax1.set_ylim(v_min, v_max)
             elif chart_type == "Histogram":
                 sns.histplot(data=display_df, x=active_target, hue='SOURCE_FILE', kde=True, ax=ax1)
                 apply_global_legend(ax1, global_legend_loc, show_legend)
+                if use_custom_scale: ax1.set_xlim(v_min, v_max)
             
+            # [수정 3] 부가 정보 없이 사용자가 입력한 제목만 출력
             ax1.set_title(custom_title)
             ax1.set_xlabel(custom_x_legend); ax1.set_ylabel(custom_y_legend)
             st.pyplot(fig1)
+
+            st.markdown("---")
+            st.subheader(f"📊 Single Layer Statistics ({selected_layer})")
+            s_stats = display_df.groupby('SOURCE_FILE')[active_target].agg(['mean', 'std', 'min', 'max', 'count']).reset_index()
+            s_stats['3-Sigma'] = s_stats['std'] * 3
+            st.dataframe(s_stats)
 
         with tab2:
             if len(unique_layers) > 1:
                 fig2, ax2 = plt.subplots(figsize=(p_w, p_h))
                 sns.boxplot(data=combined_df, x='L_NUM', y='MEAS_VALUE', hue='SOURCE_FILE', ax=ax2)
                 apply_global_legend(ax2, global_legend_loc, show_legend)
+                if use_custom_scale: ax2.set_ylim(v_min, v_max)
+                # [수정 3] 제목 통일
                 ax2.set_title(custom_title)
                 ax2.set_xlabel("Layer Number"); ax2.set_ylabel(f"{d_type} Value")
                 st.pyplot(fig2)
-            else: st.info("Need more than 1 layer for comparison.")
+
+                st.markdown("---")
+                st.subheader("📊 Layer-wise Comparison Statistics")
+                c_stats = combined_df.groupby(['SOURCE_FILE', 'L_NUM'])['MEAS_VALUE'].agg(['mean', 'std', 'min', 'max', 'count']).reset_index()
+                c_stats['3-Sigma'] = c_stats['std'] * 3
+                st.dataframe(c_stats)
+                st.download_button("📥 Export Comparison Stats CSV", c_stats.to_csv(index=False).encode('utf-8'), "layer_stats.csv")
+            else:
+                st.info("For comparison, need 2 more layers")
 
         with tab3:
             shift_df = combined_df.dropna(subset=['P_ID'])
             if not shift_df.empty and len(unique_layers) > 1:
+                st.subheader("Inter-Layer Alignment & Shift Magnitude Heatmap")
+                
                 trend_list = []
+                heatmap_data_list = []
+                
                 for src in shift_df['SOURCE_FILE'].unique():
                     src_df = shift_df[shift_df['SOURCE_FILE'] == src]
                     base = src_df[src_df['L_NUM'] == 0][['P_ID', 'X_VAL', 'Y_VAL']]
+                    
                     if not base.empty:
                         for lyr in unique_layers:
                             target = src_df[src_df['L_NUM'] == lyr][['P_ID', 'X_VAL', 'Y_VAL']]
                             merged = pd.merge(base, target, on='P_ID', suffixes=('_REF', '_TGT'))
                             if not merged.empty:
-                                trend_list.append({'Source': src, 'Layer': lyr, 
-                                                   'Avg_DX': (merged['X_VAL_TGT'] - merged['X_VAL_REF']).mean(), 
-                                                   'Avg_DY': (merged['Y_VAL_TGT'] - merged['Y_VAL_REF']).mean()})
+                                merged['DX'] = merged['X_VAL_TGT'] - merged['X_VAL_REF']
+                                merged['DY'] = merged['Y_VAL_TGT'] - merged['Y_VAL_REF']
+                                merged['MAG'] = np.sqrt(merged['DX']**2 + merged['DY']**2)
+                                
+                                trend_list.append({'Source': src, 'Layer': lyr, 'Avg_DX': merged['DX'].mean(), 'Avg_DY': merged['DY'].mean(), 'Avg_Mag': merged['MAG'].mean()})
+                                merged['Layer'] = lyr; merged['Source'] = src
+                                heatmap_data_list.append(merged)
+
                 if trend_list:
                     trend_df = pd.DataFrame(trend_list)
                     fig3, ax3 = plt.subplots(figsize=(p_w, p_h))
                     for src in trend_df['Source'].unique():
                         data = trend_df[trend_df['Source'] == src]
-                        ax3.plot(data['Avg_DX'], data['Layer'], marker='o', label=f"{src} (X)")
-                        ax3.plot(data['Avg_DY'], data['Layer'], marker='s', ls='--', label=f"{src} (Y)")
+                        ax3.plot(data['Avg_DX'], data['Layer'], marker='o', label=f"{src} (X Avg)")
+                        ax3.plot(data['Avg_DY'], data['Layer'], marker='s', ls='--', label=f"{src} (Y Avg)")
+                    ax3.axvline(0, color='black', alpha=0.3)
+                    ax3.set_yticks(unique_layers)
+                    ax3.set_xlabel("Average Shift (um)"); ax3.set_ylabel("Layer Number")
+                    # [수정 3] 제목 통일
                     ax3.set_title(custom_title)
                     apply_global_legend(ax3, global_legend_loc, show_legend)
                     st.pyplot(fig3)
 
-        # --- [기능 2] 🧊 3D Visualization (Layer Stack) ---
-        with tab4:
-            st.subheader("Interactive 3D Layer Stack View")
-            fig_3d = px.scatter_3d(
-                combined_df, x='X_VAL', y='Y_VAL', z='L_NUM',
-                color='MEAS_VALUE', size_max=5, opacity=0.7,
-                color_continuous_scale='Viridis',
-                labels={'X_VAL': 'X (um)', 'Y_VAL': 'Y (um)', 'L_NUM': 'Layer'},
-                title=f"3D Distribution: {custom_title}"
-            )
-            fig_3d.update_layout(margin=dict(l=0, r=0, b=0, t=40), height=700)
-            st.plotly_chart(fig_3d, use_container_width=True)
-            st.info("💡 마우스를 드래그하여 회전하거나, 스크롤하여 확대/축소할 수 있습니다.")
-
-else:
-    st.info("Please upload CSV files to start analysis.")
+                    st.markdown("---")
+                    st.subheader("📊 Multi-Layer Shift Trend Statistics")
+                    st.dataframe(trend_df)
+                    st.download_button("📥 Export Trend CSV", trend_df.class_to_csv(index=False).encode('utf-8'), "alignment_trend.csv")
+                    
+                    st.markdown("---")
+                    st.subheader("Shift Magnitude Map (Relative to Layer 0)")
+                    h_layer = st.selectbox("Select Layer for Heatmap", unique_layers[1:])
+                    h_df_all = pd.concat(heatmap_data_list)
+                    h_df = h_df_all[h_df_all['Layer'] == h_layer]
+                    
+                    fig4, ax4 = plt.subplots(figsize=(p_w, p_h))
+                    sc_h = ax4.scatter(h_df['X_VAL_REF'], h_df['Y_VAL_REF'], c=h_df['MAG'], cmap='Reds', s=20)
+                    plt.colorbar(sc_h, label="Shift Magnitude (um)")
+                    ax4.set_title(f"Layer {h_layer} Shift Intensity Map")
+                    ax4.set_xlabel(custom_x_legend); ax4.set_ylabel(custom_y_legend)
+                    st.pyplot(fig4)
+            else:
+                st.info("Pillar/Coordinate data and need layer 0")
