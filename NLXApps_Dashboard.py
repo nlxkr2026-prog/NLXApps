@@ -4,10 +4,11 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import plotly.figure_factory as ff
+from io import BytesIO
 
 # --- 1. 페이지 설정 ---
 st.set_page_config(page_title="Bump Master Analyzer Pro", layout="wide")
-st.title("🔬 Universal Bump Quality Analyzer (Fully Editable)")
+st.title("🔬 Universal Bump Quality Analyzer (Export Enabled)")
 
 # --- 2. 사이드바 설정 ---
 st.sidebar.header("⚙️ 분석 및 시각화 설정")
@@ -30,7 +31,7 @@ if uploaded_files:
     hist_layout = st.sidebar.selectbox("히스토그램 레이아웃", ["Facet (파일별 분할)", "Overlay (겹쳐보기)"])
     vector_scale = st.sidebar.slider("화살표 배율 (Vector Scale)", 1, 200, 50)
 
-    # --- 3. 핵심 로직 함수 ---
+    # --- 3. 로직 함수 ---
     def apply_iqr_filter(series):
         if series.dropna().empty: return series
         Q1, Q3 = series.quantile(0.25), series.quantile(0.75)
@@ -76,9 +77,9 @@ if uploaded_files:
             res.append(ldf)
         return pd.concat(res) if res else df
 
-    # --- 4. 데이터 로드 및 마스터 매핑 ---
+    # --- 4. 메인 데이터 처리 엔진 ---
     raw_data_dict = {f.name: preprocess_df(pd.read_csv(f), scale_factor) for f in uploaded_files}
-    st.info("🎯 **Master File**을 선택하세요. 모든 지표의 좌표 기준이 됩니다.")
+    st.info("🎯 **Master File**을 선택하세요. 모든 데이터가 이 기준에 따라 통합됩니다.")
     m_options = ["Independent Analysis"] + list(raw_data_dict.keys())
     m_key = st.selectbox("레이어 기준(Master) 파일 선택", m_options)
     
@@ -111,36 +112,53 @@ if uploaded_files:
 
     if final_processed_list:
         total_df = pd.concat(final_processed_list, ignore_index=True)
-        # 차트 편집 기능 활성화 설정
         plot_config = {'editable': True, 'displaylogo': False}
 
-        st.subheader("📊 Summary Statistics")
+        # --- [추가] 5. 데이터 Export 기능 ---
+        st.subheader("📁 Data Export")
         m_list = [c for c in ['Radius', 'Height', 'Pitch_X', 'Pitch_Y', 'Shift_X', 'Shift_Y', 'Shift_Norm'] if c in total_df.columns]
-        st.dataframe(total_df.groupby(['File_Name', 'Inferred_Layer'])[m_list].agg(['mean', 'std', 'count']).round(3), use_container_width=True)
+        
+        # 통계 요약표 생성
+        summary_by_layer = total_df.groupby(['File_Name', 'Inferred_Layer'])[m_list].agg(['mean', 'std', 'min', 'max', 'count']).round(3)
+        summary_total = total_df.groupby(['File_Name'])[m_list].agg(['mean', 'std', 'count']).round(3)
 
+        # Excel 파일 생성 (BytesIO)
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            summary_by_layer.to_excel(writer, sheet_name='Layer_Statistics')
+            summary_total.to_excel(writer, sheet_name='Total_Statistics')
+            # 상세 데이터도 포함 (필요시)
+            total_df.to_excel(writer, sheet_name='Raw_Data_Cleaned', index=False)
+        
+        st.download_button(
+            label="📥 Download Statistics as Excel",
+            data=output.getvalue(),
+            file_name="Bump_Quality_Report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+        st.divider()
+        st.subheader("📊 Summary Preview")
+        st.dataframe(summary_by_layer, use_container_width=True)
+
+        # --- 탭 구성 (Tab 1, 2, 3 동일) ---
         tab1, tab2, tab3 = st.tabs(["📏 Group A (Shape)", "🎯 Group B (Shift)", "🌐 3D View"])
 
         with tab1:
             st.header("Group A: Shape Analysis")
             sel_a = st.selectbox("지표 선택 (A)", [c for c in ['Radius', 'Height', 'Pitch_X', 'Pitch_Y'] if c in total_df.columns])
             pdf_a = total_df.dropna(subset=[sel_a])
-            
             c1, c2 = st.columns(2)
-            # Boxplot
-            fig_box_a = px.box(pdf_a, x="File_Name", y=sel_a, color="Inferred_Layer" if "Split" in layer_view_mode else None, points=False, title=f"{sel_a} Boxplot (Click title to edit)")
-            c1.plotly_chart(fig_box_a, use_container_width=True, config=plot_config)
-            # Histogram
-            fig_hist_a = px.histogram(pdf_a, x=sel_a, color="File_Name" if "Split" not in layer_view_mode else "Inferred_Layer", barmode="overlay", facet_col="File_Name" if "Facet" in hist_layout else None, title=f"{sel_a} Distribution")
-            c2.plotly_chart(fig_hist_a, use_container_width=True, config=plot_config)
+            c1.plotly_chart(px.box(pdf_a, x="File_Name", y=sel_a, color="Inferred_Layer" if "Split" in layer_view_mode else None, points=False, title=f"{sel_a} Boxplot"), use_container_width=True, config=plot_config)
+            c2.plotly_chart(px.histogram(pdf_a, x=sel_a, color="File_Name" if "Split" not in layer_view_mode else "Inferred_Layer", barmode="overlay", facet_col="File_Name" if "Facet" in hist_layout else None, title=f"{sel_a} Distribution"), use_container_width=True, config=plot_config)
             
             st.divider()
-            # Group A Map: Scatter Heatmap
             st.subheader(f"📍 Spatial Heatmap: {sel_a}")
             f_m_a = st.selectbox("지도 출력 파일 선택", pdf_a['File_Name'].unique(), key="ma_f")
             m_a_df = pdf_a[pdf_a['File_Name'] == f_m_a]
             if not m_a_df.empty:
                 xc_h, yc_h = ('Bump_Center_X', 'Bump_Center_Y') if 'Bump_Center_X' in m_a_df.columns else ('X_Coord', 'Y_Coord')
-                fig_heat = px.scatter(m_a_df, x=xc_h, y=yc_h, color=sel_a, facet_col="Inferred_Layer", color_continuous_scale="Turbo", title=f"{f_m_a} - {sel_a} Spatial Map")
+                fig_heat = px.scatter(m_a_df, x=xc_h, y=yc_h, color=sel_a, facet_col="Inferred_Layer", color_continuous_scale="Turbo")
                 fig_heat.update_yaxes(scaleanchor="x", scaleratio=1)
                 st.plotly_chart(fig_heat, use_container_width=True, config=plot_config)
 
@@ -151,26 +169,19 @@ if uploaded_files:
                 sel_b = st.selectbox("Shift 지표 선택", b_mets)
                 pdf_b = total_df.dropna(subset=[sel_b])
                 c1, c2 = st.columns(2)
-                # Boxplot
-                fig_box_b = px.box(pdf_b, x="File_Name", y=sel_b, color="Inferred_Layer" if "Split" in layer_view_mode else None, points=False, title=f"{sel_b} Boxplot")
-                c1.plotly_chart(fig_box_b, use_container_width=True, config=plot_config)
-                # Histogram
-                fig_hist_b = px.histogram(pdf_b, x=sel_b, color="File_Name" if "Split" not in layer_view_mode else "Inferred_Layer", barmode="overlay", facet_col="File_Name" if "Facet" in hist_layout else None)
-                c2.plotly_chart(fig_hist_b, use_container_width=True, config=plot_config)
+                c1.plotly_chart(px.box(pdf_b, x="File_Name", y=sel_b, color="Inferred_Layer" if "Split" in layer_view_mode else None, points=False), use_container_width=True, config=plot_config)
+                c2.plotly_chart(px.histogram(pdf_b, x=sel_b, color="File_Name" if "Split" not in layer_view_mode else "Inferred_Layer", barmode="overlay", facet_col="File_Name" if "Facet" in hist_layout else None), use_container_width=True, config=plot_config)
                 
                 st.divider()
-                # Group B Map: Vector Map (Arrow)
-                st.subheader("📍 Shift Vector Map (Arrow Display)")
+                st.subheader("📍 Shift Vector Map")
                 v_f = st.selectbox("화살표 맵 파일 선택", pdf_b['File_Name'].unique(), key="v_f_b")
                 v_d = pdf_b[(pdf_b['File_Name'] == v_f) & pdf_b['Shift_X'].notna()]
                 if not v_d.empty:
                     xc, yc = ('Bump_Center_X', 'Bump_Center_Y') if 'Bump_Center_X' in v_d.columns else ('X_Coord', 'Y_Coord')
-                    fig_v = ff.create_quiver(x=v_d[xc], y=v_d[yc], u=v_d['Shift_X']*vector_scale, v=v_d['Shift_Y']*vector_scale, scale=1, arrow_scale=0.2, line=dict(color='red', width=1))
+                    fig_v = ff.create_quiver(x=v_d[xc], y=v_d[yc], u=v_d['Shift_X']*vector_scale, v=v_df['Shift_Y']*vector_scale if 'v_df' in locals() else v_d['Shift_Y']*vector_scale, scale=1, arrow_scale=0.2, line=dict(color='red', width=1))
                     fig_v.add_trace(go.Scatter(x=v_d[xc], y=v_d[yc], mode='markers', marker=dict(size=3, color='blue', opacity=0.3), name='Bump Center'))
-                    fig_v.update_layout(height=800, yaxis=dict(scaleanchor="x", scaleratio=1), title=f"Vector Shift Map: {v_f} (Click to edit title)")
+                    fig_v.update_layout(height=800, yaxis=dict(scaleanchor="x", scaleratio=1))
                     st.plotly_chart(fig_v, use_container_width=True, config=plot_config)
-            else:
-                st.warning("Shift 데이터가 없습니다.")
 
         with tab3:
             st.header("🌐 3D Structural View")
@@ -194,11 +205,11 @@ if uploaded_files:
                     cx, cy = st.columns(2)
                     hth = cx.number_input("High (Red)", value=float(df3[c_3].max()))
                     lth = cy.number_input("Low (Yellow)", value=float(df3[c_3].min()))
-                    df3['Color'] = df3[c_3].apply(lambda v: 'Critical' if v >= hth else ('Warning' if v <= lth else 'Normal'))
+                    df3['Color'] = df3[c_3].apply(lambda v: 'Critical' if v >= hth else ('Warning' if v <= l_th else 'Normal'))
                     fig3 = px.scatter_3d(df3, x=x3, y=y3, z=z3, color='Color', color_discrete_map={'Critical': 'red', 'Warning': 'yellow', 'Normal': 'lightgray'})
                 else:
                     fig3 = px.scatter_3d(df3, x=x3, y=y3, z=z3, color=c_3, color_continuous_scale='Turbo')
-                fig3.update_layout(scene=dict(aspectmode='data'), height=800, title=f"3D Map: {c_3}")
+                fig3.update_layout(scene=dict(aspectmode='data'), height=800)
                 st.plotly_chart(fig3, use_container_width=True, config=plot_config)
 else:
-    st.info("파일을 업로드하면 통합 분석이 시작됩니다.")
+    st.info("파일을 업로드하면 보고서 생성 및 분석이 가능합니다.")
