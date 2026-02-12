@@ -8,8 +8,7 @@ import io
 import os
 
 # --- [1] 데이터 전처리 및 정밀 Pitch 계산 로직 ---
-def process_data(df, scale_factor, apply_iqr, pitch_threshold):
-    # 컬럼명 표준화
+def process_data(df, scale_factor, apply_iqr, pitch_sensitivity):
     df.columns = [c.strip().upper() for c in df.columns]
     
     # 1. 데이터 타입 판별
@@ -27,7 +26,6 @@ def process_data(df, scale_factor, apply_iqr, pitch_threshold):
     # 2. 좌표 설정 (Multiplier 적용)
     df['X_VAL'] = (df['X_COORD'] if 'X_COORD' in df.columns else df.get('BUMP_CENTER_X', 0)) * scale_factor
     df['Y_VAL'] = (df['Y_COORD'] if 'Y_COORD' in df.columns else df.get('BUMP_CENTER_Y', 0)) * scale_factor
-    
     for col in target_cols:
         df[col + '_UM'] = df[col] * scale_factor
     df['MEAS_VALUE'] = df[target_cols[0] + '_UM']
@@ -46,31 +44,41 @@ def process_data(df, scale_factor, apply_iqr, pitch_threshold):
         else: df['L_NUM'] = 0
     else: df['L_NUM'] = 0
 
-    # 4. Pitch 계산 알고리즘
+    # 4. [정밀 Pitch 알고리즘]
     df['P_ID'] = df['GROUP_ID'] if 'GROUP_ID' in df.columns else df.index
     group_base = ['SOURCE_FILE', 'L_NUM'] if 'SOURCE_FILE' in df.columns else ['L_NUM']
     grid_size = 0.5 
 
-    # X_Pitch 계산
+    # X_Pitch 계산 (Y 그리드 기준)
     df['Y_GRID'] = (df['Y_VAL'] / grid_size).round() * grid_size
     df = df.sort_values(by=group_base + ['Y_GRID', 'X_VAL'])
     df['ID_DIFF'] = df.groupby(group_base + ['Y_GRID'])['P_ID'].diff()
+    # [제안 반영] ID가 1 차이가 아니면(Missing 발생 지점) Pitch 계산 제외
     df['X_PITCH'] = np.where(df['ID_DIFF'] == 1, df.groupby(group_base + ['Y_GRID'])['X_VAL'].diff().abs(), np.nan)
 
-    # Y_Pitch 계산
+    # Y_Pitch 계산 (X 그리드 기준)
     df['X_GRID'] = (df['X_VAL'] / grid_size).round() * grid_size
     df = df.sort_values(by=group_base + ['X_GRID', 'Y_VAL'])
-    df['Y_PITCH'] = df.groupby(group_base + ['X_GRID'])['Y_VAL'].diff().abs()
+    # Y축은 ID가 불규칙할 수 있으므로 먼저 Raw 계산 후 통계 필터 적용
+    df['Y_P_RAW'] = df.groupby(group_base + ['X_GRID'])['Y_VAL'].diff().abs()
 
-    # [수정] Pitch 전용 가변 IQR 필터 (사용자 옵션 반영)
+    # [제안 반영] Pitch 통계 필터 (평균 기반 1.5배 이상/이하 제거)
+    for col in ['X_PITCH', 'Y_P_RAW']:
+        valid_data = df[col].dropna()
+        if not valid_data.empty:
+            avg_p = valid_data.mean()
+            # 평균의 1.5배 초과(Missing 배수) 혹은 0.5배 미만(노이즈) 제거
+            df[col] = np.where((df[col] > avg_p * 1.5) | (df[col] < avg_p * 0.5), np.nan, df[col])
+    
+    df['Y_PITCH'] = df['Y_P_RAW']
+
+    # Pitch 전용 IQR 필터 (마지막 정제)
     for col in ['X_PITCH', 'Y_PITCH']:
         valid_p = df[col].dropna()
         if not valid_p.empty:
             q1, q3 = valid_p.quantile([0.25, 0.75])
             iqr_p = q3 - q1
-            # 사용자가 입력한 pitch_threshold (예: 1.0)를 사용하여 이상치 제거
-            # Missing Bump로 인한 배수 Pitch(30, 45 등)를 걸러내기 위해 타이트하게 조절 가능
-            df.loc[(df[col] < q1 - pitch_threshold*iqr_p) | (df[col] > q3 + pitch_threshold*iqr_p), col] = np.nan
+            df.loc[(df[col] < q1 - pitch_sensitivity*iqr_p) | (df[col] > q3 + pitch_sensitivity*iqr_p), col] = np.nan
 
     # 5. 측정값 이상치 제거
     df_clean = df[df['MEAS_VALUE'] != 0].copy()
@@ -103,11 +111,10 @@ with st.sidebar:
     scale = st.number_input("Multiplier (Scale Factor)", value=1.0, format="%.4f")
     use_iqr = st.checkbox("Apply IQR Filter (Meas. Value)", value=True)
 
-    # [신규] Pitch 전용 필터 옵션 추가
     st.markdown("---")
     st.subheader("🎯 Pitch Filter Settings")
-    pitch_threshold = st.slider("Pitch Filter Sensitivity (IQR Multiplier)", 0.5, 3.0, 1.2, 0.1, 
-                                help="값이 낮을수록 평균에서 조금만 벗어나도 제거합니다. Missing bump로 인한 배수 Pitch를 제거하려면 1.0~1.2를 권장합니다.")
+    # Pitch 필터 강도 조절 (기본 1.2로 타이트하게 설정)
+    pitch_sensitivity = st.slider("Pitch Outlier Sensitivity", 0.5, 3.0, 1.2, 0.1)
 
     with st.expander("🎨 Plot Settings", expanded=True):
         p_w = st.slider("Plot Width", 5, 25, 12)
@@ -127,8 +134,8 @@ if uploaded_files:
     all_data = []
     for file in uploaded_files:
         raw_df = pd.read_csv(file)
-        # pitch_threshold 옵션 전달
-        p_df, d_type = process_data(raw_df, scale, use_iqr, pitch_threshold)
+        # pitch_sensitivity 파라미터 전달
+        p_df, d_type = process_data(raw_df, scale, use_iqr, pitch_sensitivity)
         if p_df is not None:
             p_df['SOURCE_FILE'] = os.path.splitext(file.name)[0]
             all_data.append(p_df)
@@ -143,12 +150,12 @@ if uploaded_files:
         m2.metric("Global 3-Sigma", f"{(combined_df['MEAS_VALUE'].std()*3):.3f}")
         m3.metric("Max-Min Range", f"{(combined_df['MEAS_VALUE'].max()-combined_df['MEAS_VALUE'].min()):.3f}")
         m4.metric("Total Bumps", f"{len(combined_df):,}")
-
+        
         st.markdown("---")
         tabs = st.tabs(["📊 Single Layer", "📈 Comparison", "📉 Shift Trend", "🧊 3D View", "🎯 Pitch Analysis"])
 
         with tabs[0]:
-            sel_layer = st.selectbox("Select Layer ", ["All Layers"] + [f"Layer {i}" for i in unique_layers])
+            sel_layer = st.selectbox("Select Layer", ["All Layers"] + [f"Layer {i}" for i in unique_layers])
             disp_df = combined_df if sel_layer == "All Layers" else combined_df[combined_df['L_NUM'] == int(sel_layer.split(" ")[1])]
             fig1, ax1 = plt.subplots(figsize=(p_w, p_h))
             sns.histplot(data=disp_df, x='MEAS_VALUE', hue='SOURCE_FILE', kde=True, ax=ax1)
@@ -158,7 +165,7 @@ if uploaded_files:
 
         with tabs[4]:
             st.subheader("🎯 Pitch Distribution Analysis")
-            sel_layer_p = st.selectbox("Select Layer for Pitch", ["All Layers"] + [f"Layer {i}" for i in unique_layers])
+            sel_layer_p = st.selectbox("Select Layer for Pitch", ["All Layers"] + [f"Layer {i}" for i in unique_layers], key="pitch_tab_layer")
             pitch_df = combined_df if sel_layer_p == "All Layers" else combined_df[combined_df['L_NUM'] == int(sel_layer_p.split(" ")[1])]
             
             col_p1, col_p2 = st.columns(2)
@@ -178,3 +185,4 @@ if uploaded_files:
 
 else:
     st.info("Please upload CSV files.")
+    
