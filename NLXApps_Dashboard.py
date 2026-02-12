@@ -8,7 +8,8 @@ import io
 import os
 
 # --- [1] 데이터 전처리 및 정밀 Pitch 계산 로직 ---
-def process_data(df, scale_factor, apply_iqr):
+def process_data(df, scale_factor, apply_iqr, pitch_threshold):
+    # 컬럼명 표준화
     df.columns = [c.strip().upper() for c in df.columns]
     
     # 1. 데이터 타입 판별
@@ -23,7 +24,7 @@ def process_data(df, scale_factor, apply_iqr):
     elif 'X_COORD' in df.columns: d_type, target_cols = "Coordinate", ['X_COORD']
     else: return None, None
 
-    # 2. 좌표 설정 (Multiplier를 즉시 적용하여 모든 계산을 um 단위로 통일)
+    # 2. 좌표 설정 (Multiplier 적용)
     df['X_VAL'] = (df['X_COORD'] if 'X_COORD' in df.columns else df.get('BUMP_CENTER_X', 0)) * scale_factor
     df['Y_VAL'] = (df['Y_COORD'] if 'Y_COORD' in df.columns else df.get('BUMP_CENTER_Y', 0)) * scale_factor
     
@@ -45,38 +46,31 @@ def process_data(df, scale_factor, apply_iqr):
         else: df['L_NUM'] = 0
     else: df['L_NUM'] = 0
 
-    # 4. [개선] 양산형 Pitch 계산 (데이터 스케일 대응형)
+    # 4. Pitch 계산 알고리즘
     df['P_ID'] = df['GROUP_ID'] if 'GROUP_ID' in df.columns else df.index
     group_base = ['SOURCE_FILE', 'L_NUM'] if 'SOURCE_FILE' in df.columns else ['L_NUM']
-
-    # 데이터의 최소 간격을 파악하여 그리드 크기를 유동적으로 결정 (um 단위 기준 보통 1.0~10.0 사이)
-    # scale_factor가 1000이면 round(0), 1이면 round(3)이 적절함. 이를 자동화하기 위해 0.5um 단위 그리드 사용
     grid_size = 0.5 
-    
-    # X_Pitch 계산 (Y 그리드 기준 정렬)
+
+    # X_Pitch 계산
     df['Y_GRID'] = (df['Y_VAL'] / grid_size).round() * grid_size
     df = df.sort_values(by=group_base + ['Y_GRID', 'X_VAL'])
-    
-    # GroupID가 연속적인 경우만 계산 (행 바뀜 방지)
     df['ID_DIFF'] = df.groupby(group_base + ['Y_GRID'])['P_ID'].diff()
     df['X_PITCH'] = np.where(df['ID_DIFF'] == 1, df.groupby(group_base + ['Y_GRID'])['X_VAL'].diff().abs(), np.nan)
 
-    # Y_Pitch 계산 (X 그리드 기준 정렬)
+    # Y_Pitch 계산
     df['X_GRID'] = (df['X_VAL'] / grid_size).round() * grid_size
     df = df.sort_values(by=group_base + ['X_GRID', 'Y_VAL'])
-    
-    # Y축 방향은 ID가 건너뛸 수 있으므로 좌표 차이가 일정 거리(예: 예상 Pitch의 1.5배) 이내인 경우만 계산
-    df['Y_P_RAW'] = df.groupby(group_base + ['X_GRID'])['Y_VAL'].diff().abs()
-    # 일반적인 반도체 범프 피치(약 50um)를 고려하여 100um 이상은 무시
-    df['Y_PITCH'] = np.where(df['Y_P_RAW'] < 100, df['Y_P_RAW'], np.nan)
+    df['Y_PITCH'] = df.groupby(group_base + ['X_GRID'])['Y_VAL'].diff().abs()
 
-    # Pitch 이상치 제거 (IQR)
+    # [수정] Pitch 전용 가변 IQR 필터 (사용자 옵션 반영)
     for col in ['X_PITCH', 'Y_PITCH']:
         valid_p = df[col].dropna()
         if not valid_p.empty:
             q1, q3 = valid_p.quantile([0.25, 0.75])
             iqr_p = q3 - q1
-            df.loc[(df[col] < q1 - 1.5*iqr_p) | (df[col] > q3 + 1.5*iqr_p), col] = np.nan
+            # 사용자가 입력한 pitch_threshold (예: 1.0)를 사용하여 이상치 제거
+            # Missing Bump로 인한 배수 Pitch(30, 45 등)를 걸러내기 위해 타이트하게 조절 가능
+            df.loc[(df[col] < q1 - pitch_threshold*iqr_p) | (df[col] > q3 + pitch_threshold*iqr_p), col] = np.nan
 
     # 5. 측정값 이상치 제거
     df_clean = df[df['MEAS_VALUE'] != 0].copy()
@@ -106,8 +100,14 @@ st.title("🔬 NLX Bump Analysis Dashboard")
 with st.sidebar:
     st.header("📁 Data Config")
     uploaded_files = st.file_uploader("Upload CSV Files", type=['csv'], accept_multiple_files=True)
-    scale = st.number_input("Multiplier (Scale Factor)", value=1.0, format="%.4f", step=None)
-    use_iqr = st.checkbox("Apply IQR Filter", value=True)
+    scale = st.number_input("Multiplier (Scale Factor)", value=1.0, format="%.4f")
+    use_iqr = st.checkbox("Apply IQR Filter (Meas. Value)", value=True)
+
+    # [신규] Pitch 전용 필터 옵션 추가
+    st.markdown("---")
+    st.subheader("🎯 Pitch Filter Settings")
+    pitch_threshold = st.slider("Pitch Filter Sensitivity (IQR Multiplier)", 0.5, 3.0, 1.2, 0.1, 
+                                help="값이 낮을수록 평균에서 조금만 벗어나도 제거합니다. Missing bump로 인한 배수 Pitch를 제거하려면 1.0~1.2를 권장합니다.")
 
     with st.expander("🎨 Plot Settings", expanded=True):
         p_w = st.slider("Plot Width", 5, 25, 12)
@@ -120,21 +120,15 @@ with st.sidebar:
         show_legend = st.checkbox("Show Legend", value=True)
         global_legend_loc = st.selectbox("Legend Loc", options=["best", "upper right", "upper left", "lower left", "lower right", "right", "center"], index=1)
         use_custom_scale = st.checkbox("Manual Axis Range", value=False)
-        v_min = st.number_input("Min Limit", value=-10.0, step=None)
-        v_max = st.number_input("Max Limit", value=10.0, step=None)
-
-    with st.expander("🧊 3D & Outlier Settings", expanded=False):
-        color_option = st.selectbox("Color Theme", ["Viridis", "Plasma", "Jet", "Turbo"])
-        use_outlier_filter = st.checkbox("Highlight Outliers")
-        outlier_low = st.number_input("Lower Bound (Yellow)", value=-5.0, step=None)
-        outlier_high = st.number_input("Upper Bound (Red)", value=5.0, step=None)
+        v_min = st.number_input("Min Limit", value=-10.0)
+        v_max = st.number_input("Max Limit", value=10.0)
 
 if uploaded_files:
     all_data = []
     for file in uploaded_files:
         raw_df = pd.read_csv(file)
-        # Multiplier 적용 로직이 포함된 process_data 호출
-        p_df, d_type = process_data(raw_df, scale, use_iqr)
+        # pitch_threshold 옵션 전달
+        p_df, d_type = process_data(raw_df, scale, use_iqr, pitch_threshold)
         if p_df is not None:
             p_df['SOURCE_FILE'] = os.path.splitext(file.name)[0]
             all_data.append(p_df)
@@ -143,7 +137,6 @@ if uploaded_files:
         combined_df = pd.concat(all_data)
         unique_layers = sorted(combined_df['L_NUM'].unique())
 
-        # Quick Summary
         st.markdown("### 📋 Quick Summary")
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Global Average", f"{combined_df['MEAS_VALUE'].mean():.3f}")
@@ -151,44 +144,37 @@ if uploaded_files:
         m3.metric("Max-Min Range", f"{(combined_df['MEAS_VALUE'].max()-combined_df['MEAS_VALUE'].min()):.3f}")
         m4.metric("Total Bumps", f"{len(combined_df):,}")
 
+        st.markdown("---")
         tabs = st.tabs(["📊 Single Layer", "📈 Comparison", "📉 Shift Trend", "🧊 3D View", "🎯 Pitch Analysis"])
 
         with tabs[0]:
-            sel_layer = st.selectbox("Select Layer", ["All Layers"] + [f"Layer {i}" for i in unique_layers])
+            sel_layer = st.selectbox("Select Layer ", ["All Layers"] + [f"Layer {i}" for i in unique_layers])
             disp_df = combined_df if sel_layer == "All Layers" else combined_df[combined_df['L_NUM'] == int(sel_layer.split(" ")[1])]
             fig1, ax1 = plt.subplots(figsize=(p_w, p_h))
             sns.histplot(data=disp_df, x='MEAS_VALUE', hue='SOURCE_FILE', kde=True, ax=ax1)
             if use_custom_scale: ax1.set_xlim(v_min, v_max)
             apply_global_legend(ax1, global_legend_loc, show_legend)
-            ax1.set_title(custom_title); ax1.set_xlabel(x_lbl); ax1.set_ylabel(y_lbl)
             st.pyplot(fig1)
 
-        with tabs[3]:
-            st.subheader("Interactive 3D Layer Stack View")
-            plot_3d_df = combined_df.copy()
-            if use_outlier_filter:
-                conditions = [(plot_3d_df['MEAS_VALUE'] < outlier_low), (plot_3d_df['MEAS_VALUE'] > outlier_high)]
-                choices = ['Under Limit (Low)', 'Over Limit (High)']
-                plot_3d_df['Status'] = np.select(conditions, choices, default='Normal')
-                fig_3d = px.scatter_3d(plot_3d_df, x='X_VAL', y='Y_VAL', z='L_NUM', color='Status',
-                                     color_discrete_map={'Under Limit (Low)': 'yellow', 'Over Limit (High)': 'red', 'Normal': 'blue'},
-                                     opacity=0.6)
-            else:
-                fig_3d = px.scatter_3d(plot_3d_df, x='X_VAL', y='Y_VAL', z='L_NUM', color='MEAS_VALUE', color_continuous_scale=color_option.lower())
-            fig_3d.update_layout(height=700); st.plotly_chart(fig_3d, use_container_width=True)
-
         with tabs[4]:
-            st.subheader("🎯 Pitch Analysis (X & Y Distribution)")
+            st.subheader("🎯 Pitch Distribution Analysis")
+            sel_layer_p = st.selectbox("Select Layer for Pitch", ["All Layers"] + [f"Layer {i}" for i in unique_layers])
+            pitch_df = combined_df if sel_layer_p == "All Layers" else combined_df[combined_df['L_NUM'] == int(sel_layer_p.split(" ")[1])]
+            
             col_p1, col_p2 = st.columns(2)
             for col, p_type, p_color in zip([col_p1, col_p2], ['X_PITCH', 'Y_PITCH'], ['Blues', 'Reds']):
                 with col:
                     st.markdown(f"**{p_type} Analysis**")
                     fig_p, ax_p = plt.subplots(figsize=(p_w/2, p_h))
-                    sns.boxplot(data=combined_df, x='SOURCE_FILE', y=p_type, hue='SOURCE_FILE', ax=ax_p, palette=p_color)
+                    sns.boxplot(data=pitch_df, x='SOURCE_FILE', y=p_type, hue='SOURCE_FILE', ax=ax_p, palette=p_color)
                     apply_global_legend(ax_p, global_legend_loc, show_legend); st.pyplot(fig_p)
                     
                     fig_h, ax_h = plt.subplots(figsize=(p_w/2, p_h))
-                    sns.histplot(data=combined_df, x=p_type, hue='SOURCE_FILE', kde=True, ax=ax_h)
+                    sns.histplot(data=pitch_df, x=p_type, hue='SOURCE_FILE', kde=True, ax=ax_h)
                     apply_global_legend(ax_h, global_legend_loc, show_legend); st.pyplot(fig_h)
+            
+            st.markdown("**Pitch Stats Summary**")
+            st.dataframe(pitch_df.groupby('SOURCE_FILE')[['X_PITCH', 'Y_PITCH']].mean().style.format("{:.3f}"), use_container_width=True)
+
 else:
-    st.info("Please upload CSV files to begin analysis.")
+    st.info("Please upload CSV files.")
