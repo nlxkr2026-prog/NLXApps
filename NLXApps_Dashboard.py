@@ -6,39 +6,30 @@ import seaborn as sns
 import plotly.express as px
 import os
 
-# --- [1] 데이터 통합 처리 엔진 ---
-def load_and_detect_mode(files, scale_factor, layer_gap):
-    all_processed = []
-    global_mode = "Single" # 기본값
+# --- [1] 데이터 전처리 엔진 ---
+def process_data(files, multiplier, layer_gap, apply_iqr, pitch_sens):
+    all_dfs = []
     
     for f in files:
         df = pd.read_csv(f)
         df.columns = [c.strip().upper() for c in df.columns]
         
-        # A. 모드 판별
-        if 'PILLAR_NUMBER' in df.columns and 'LAYER_NUMBER' in df.columns:
-            mode = "Multi-Shift"
-            global_mode = "Multi-Shift"
-        else:
-            mode = "Single"
+        # 1. 좌표 및 기본 컬럼 표준화
+        # X, Y 좌표 (mm -> um 등 Multiplier 적용)
+        if 'X_COORD' in df.columns: df['X_VAL'] = df['X_COORD'] * multiplier
+        elif 'BUMP_CENTER_X' in df.columns: df['X_VAL'] = df['BUMP_CENTER_X'] * multiplier
         
-        # B. 좌표 표준화 (X_VAL, Y_VAL, Z_VAL)
-        # Multi-Shift용 좌표
-        if 'X_COORD' in df.columns: df['X_VAL'] = df['X_COORD'] * scale_factor
-        elif 'BUMP_CENTER_X' in df.columns: df['X_VAL'] = df['BUMP_CENTER_X'] * scale_factor
+        if 'Y_COORD' in df.columns: df['Y_VAL'] = df['Y_COORD'] * multiplier
+        elif 'BUMP_CENTER_Y' in df.columns: df['Y_VAL'] = df['BUMP_CENTER_Y'] * multiplier
         
-        if 'Y_COORD' in df.columns: df['Y_VAL'] = df['Y_COORD'] * scale_factor
-        elif 'BUMP_CENTER_Y' in df.columns: df['Y_VAL'] = df['BUMP_CENTER_Y'] * scale_factor
-        
-        if 'Z_COORD' in df.columns: df['Z_VAL'] = df['Z_COORD'] * scale_factor
-        elif 'BUMP_CENTER_Z' in df.columns: df['Z_VAL'] = df['BUMP_CENTER_Z'] * scale_factor
+        if 'Z_COORD' in df.columns: df['Z_VAL'] = df['Z_COORD'] * multiplier
+        elif 'BUMP_CENTER_Z' in df.columns: df['Z_VAL'] = df['BUMP_CENTER_Z'] * multiplier
         else: df['Z_VAL'] = 0
         
-        # C. 레이어 결정
+        # 2. 레이어 구분 (명시적 컬럼 우선, 없으면 Z값 기반 자동)
         if 'LAYER_NUMBER' in df.columns:
-            df['L_NUM'] = df['LAYER_NUMBER'].astype(int)
+            df['L_NUM'] = df['LAYER_NUMBER'].fillna(0).astype(int)
         else:
-            # Z값 기반 자동 레이어링
             z_arr = np.sort(df['Z_VAL'].unique())
             if len(z_arr) > 1:
                 diffs = np.diff(z_arr)
@@ -48,111 +39,175 @@ def load_and_detect_mode(files, scale_factor, layer_gap):
                 df['L_NUM'] = l_assign
             else:
                 df['L_NUM'] = 0
+                
+        # 3. 고유 식별자 설정 (Pillar > Group > Index)
+        if 'PILLAR_NUMBER' in df.columns: df['P_ID'] = df['PILLAR_NUMBER']
+        elif 'GROUP_ID' in df.columns: df['P_ID'] = df['GROUP_ID']
+        else: df['P_ID'] = df.index
         
-        # D. 식별자 고정
-        df['ID'] = df['PILLAR_NUMBER'] if 'PILLAR_NUMBER' in df.columns else df.get('GROUP_ID', df.index)
-        df['SOURCE'] = os.path.splitext(f.name)[0]
-        all_processed.append(df)
+        df['SOURCE_FILE'] = os.path.splitext(f.name)[0]
+        all_dfs.append(df)
         
-    return pd.concat(all_processed, ignore_index=True) if all_processed else None, global_mode
+    return pd.concat(all_dfs, ignore_index=True) if all_dfs else None
 
-# --- [2] UI & 분석 로직 ---
-st.set_page_config(page_title="NLX Unified Dashboard", layout="wide")
-st.title("🔬 NLX Unified Bump Analysis")
+# --- [2] Pitch 계산 로직 (Missing Bump 고려) ---
+def calculate_pitch(df, pitch_sens):
+    grid_size = 0.5 # 정렬 오차 허용 그리드
+    group_cols = ['SOURCE_FILE', 'L_NUM']
+    
+    # X-Pitch (Y 그리드 내 정렬)
+    df['Y_GRID'] = (df['Y_VAL'] / grid_size).round() * grid_size
+    df = df.sort_values(by=group_cols + ['Y_GRID', 'X_VAL'])
+    # ID가 연속적일 때만 유효 Pitch로 간주
+    df['ID_DIFF'] = df.groupby(group_cols + ['Y_GRID'])['P_ID'].diff()
+    df['X_PITCH'] = np.where(df['ID_DIFF'] == 1, df.groupby(group_cols + ['Y_GRID'])['X_VAL'].diff().abs(), np.nan)
+    
+    # Y-Pitch (X 그리드 내 정렬)
+    df['X_GRID'] = (df['X_VAL'] / grid_size).round() * grid_size
+    df = df.sort_values(by=group_base + ['X_GRID', 'Y_VAL'])
+    df['Y_PITCH'] = df.groupby(group_cols + ['X_GRID'])['Y_VAL'].diff().abs()
+    
+    # 통계적 필터링 (배수 Pitch 제거 및 IQR)
+    for col in ['X_PITCH', 'Y_PITCH']:
+        v = df[col].dropna()
+        if not v.empty:
+            avg = v.mean()
+            # 평균 1.5배 이상(Missing) 혹은 0.5배 미만(Noise) 제거
+            df[col] = np.where((df[col] > avg*1.5) | (df[col] < avg*0.5), np.nan, df[col])
+            # IQR 필터 적용
+            q1, q3 = v.quantile([0.25, 0.75])
+            df.loc[(df[col] < q1 - pitch_sens*(q3-q1)) | (df[col] > q3 + pitch_sens*(q3-q1)), col] = np.nan
+    return df
+
+# --- [3] UI & 메인 로직 ---
+st.set_page_config(page_title="NLX Unified Analysis", layout="wide")
+st.title("🔬 NLX Unified Bump Analysis Dashboard")
 
 with st.sidebar:
-    st.header("⚙️ Global Settings")
+    st.header("📁 Data Config")
     uploaded_files = st.file_uploader("Upload CSV Files", accept_multiple_files=True)
-    multiplier = st.number_input("Unit Multiplier (e.g., mm to um = 1000)", value=1, step=1)
-    gap = st.number_input("Layer Detection Gap (um)", value=5.0, step=0.5)
+    multiplier = st.number_input("Unit Multiplier (Int)", value=1, step=1, format="%d")
+    layer_gap = st.number_input("Layer Detection Gap (um)", value=5.0, step=0.5)
     
     if uploaded_files:
-        raw_combined, data_mode = load_and_detect_mode(uploaded_files, multiplier, gap)
-        st.info(f"Detected Mode: **{data_mode}**")
+        # 데이터 1차 로드
+        combined_df = process_data(uploaded_files, multiplier, layer_gap, True, 1.2)
         
-        # 분석 대상 컬럼 선택 (Pivot 기능)
-        exclude = ['X_VAL', 'Y_VAL', 'Z_VAL', 'L_NUM', 'ID', 'SOURCE', 'GROUP_ID', 'PILLAR_NUMBER', 'LAYER_NUMBER', 'X_COORD', 'Y_COORD', 'Z_COORD']
-        available_cols = [c for c in raw_combined.columns if c not in exclude and not c.endswith('_VAL')]
-        target_col = st.selectbox("Select Target Measurement", available_cols)
+        # 분석 대상 컬럼 선택 (Pivot)
+        exclude_cols = ['X_VAL', 'Y_VAL', 'Z_VAL', 'L_NUM', 'P_ID', 'SOURCE_FILE', 'Y_GRID', 'X_GRID', 'ID_DIFF']
+        available_targets = [c for c in combined_df.columns if c not in exclude_cols and not c.endswith('_UM')]
+        target_col = st.selectbox("Select Target Measurement", available_targets)
         
         st.markdown("---")
-        p_w = st.slider("Plot Width", 5, 25, 12)
-        p_h = st.slider("Plot Height", 3, 15, 6)
+        st.subheader("🧹 Filters")
+        use_iqr = st.checkbox("Apply IQR Filter to Target", value=True)
+        pitch_sens = st.slider("Pitch Outlier Sensitivity", 0.5, 3.0, 1.2)
+        
+        st.markdown("---")
+        st.subheader("📏 Scale & Legend")
+        show_legend = st.checkbox("Show Legend", value=True)
+        leg_loc = st.selectbox("Legend Loc", ["best", "upper right", "right", "center"], index=1)
+        use_manual_axis = st.checkbox("Manual Axis Range", value=False)
+        v_min = st.number_input("Min", value=-10.0)
+        v_max = st.number_input("Max", value=10.0)
 
-if uploaded_files and raw_combined is not None:
-    # 데이터 준비
-    df = raw_combined.copy()
-    # 선택된 타겟 데이터 스케일링 (이미 좌표는 처리됨)
-    df['VALUE'] = df[target_col] * multiplier
+if uploaded_files and combined_df is not None:
+    # 1. 데이터 정제 (선택된 타겟 기준)
+    df = combined_df.copy()
+    df['TARGET_VAL'] = df[target_col] * multiplier
+    
+    if use_iqr:
+        q1, q3 = df['TARGET_VAL'].quantile([0.25, 0.75])
+        iqr = q3 - q1
+        df = df[(df['TARGET_VAL'] >= q1 - 1.5*iqr) & (df['TARGET_VAL'] <= q3 + 1.5*iqr)]
+    
+    # 2. Pitch 계산
+    df = calculate_pitch(df, pitch_sens)
+    
+    # 3. 모드 판별 (Multi-Layer Shift 여부)
+    is_multi_shift = 'LAYER_NUMBER' in df.columns and 'PILLAR_NUMBER' in df.columns
     
     # 탭 구성
-    if data_mode == "Single":
-        tabs = st.tabs(["📊 Distribution", "🗺️ Heatmap", "📈 Comparison", "🎯 Pitch", "🧊 3D View"])
-    else:
-        tabs = st.tabs(["📊 Distribution", "📉 Shift Trend", "🧊 3D View"])
+    tab_list = ["📊 Statistics", "🗺️ Heatmap", "🎯 Pitch Analysis", "🧊 3D View"]
+    if is_multi_shift: tab_list.insert(2, "📉 Shift Trend")
+    tabs = st.tabs(tab_list)
 
-    # --- 공통 탭: Distribution (Histogram & Box) ---
+    # --- Tab 0: Statistics (Distributions) ---
     with tabs[0]:
-        sel_layer = st.selectbox("Select Layer", ["All"] + [f"L{i}" for i in sorted(df['L_NUM'].unique())])
-        plot_df = df if sel_layer == "All" else df[df['L_NUM'] == int(sel_layer[1:])]
+        sel_layer = st.selectbox("Select Layer View", ["All Layers"] + [f"Layer {i}" for i in sorted(df['L_NUM'].unique())])
+        plot_df = df if sel_layer == "All Layers" else df[df['L_NUM'] == int(sel_layer.split(" ")[1])]
         
         col1, col2 = st.columns(2)
         with col1:
-            fig, ax = plt.subplots(figsize=(p_w/2, p_h))
-            sns.histplot(data=plot_df, x='VALUE', hue='SOURCE', kde=True, ax=ax)
-            ax.set_title(f"{target_col} Distribution")
+            fig, ax = plt.subplots(figsize=(10, 5))
+            sns.histplot(data=plot_df, x='TARGET_VAL', hue='SOURCE_FILE', kde=True, ax=ax)
+            if use_manual_axis: ax.set_xlim(v_min, v_max)
+            if show_legend: ax.legend(loc=leg_loc, title=None)
             st.pyplot(fig)
         with col2:
-            fig, ax = plt.subplots(figsize=(p_w/2, p_h))
-            sns.boxplot(data=plot_df, x='L_NUM', y='VALUE', hue='SOURCE', ax=ax)
-            ax.set_title(f"{target_col} by Layer")
-            st.pyplot(fig)
+            st.markdown(f"**{target_col} Summary Stats (um)**")
+            stats = plot_df.groupby(['SOURCE_FILE', 'L_NUM'])['TARGET_VAL'].agg(['mean', 'std', 'min', 'max', 'count'])
+            st.dataframe(stats.style.format("{:.3f}"), use_container_width=True)
 
-    # --- Single 전용 탭: Heatmap ---
-    if data_mode == "Single":
-        with tabs[1]:
-            st.subheader(f"{target_col} Spatial Heatmap")
-            fig = px.scatter(df, x='X_VAL', y='Y_VAL', color='VALUE', facet_col='L_NUM', 
-                             hover_data=['ID'], color_continuous_scale='viridis')
-            fig.update_layout(height=500); st.plotly_chart(fig, use_container_width=True)
+    # --- Tab 1: Heatmap ---
+    with tabs[1]:
+        fig = px.scatter(df, x='X_VAL', y='Y_VAL', color='TARGET_VAL', facet_col='L_NUM',
+                         hover_data=['P_ID'], color_continuous_scale='viridis', 
+                         title=f"{target_col} Spatial Distribution")
+        fig.update_layout(height=600)
+        st.plotly_chart(fig, use_container_width=True)
 
-        with tabs[3]: # Pitch Analysis
-            st.subheader("🎯 Pitch Analysis (Logic: Sorted Grid Diff)")
-            # 간단 Pitch 로직: Row/Col별 차이
-            df_p = df.sort_values(['L_NUM', 'SOURCE', 'Y_VAL', 'X_VAL'])
-            df_p['X_PITCH'] = df_p.groupby(['L_NUM', 'SOURCE', 'Y_VAL'])['X_VAL'].diff().abs()
-            
-            fig, ax = plt.subplots(figsize=(p_w, p_h))
-            sns.boxplot(data=df_p, x='SOURCE', y='X_PITCH', hue='L_NUM', ax=ax)
-            st.pyplot(fig)
-
-    # --- Multi-Shift 전용 탭: Shift Trend ---
-    else:
-        with tabs[1]:
-            st.subheader("📉 Layer-to-Layer Shift Trend (Relative to L0)")
-            trend_data = []
-            for src in df['SOURCE'].unique():
-                src_df = df[df['SOURCE'] == src]
-                base = src_df[src_df['L_NUM'] == 0][['ID', 'X_VAL', 'Y_VAL']]
+    # --- Tab 2: Shift Trend (Only for Multi-Layer Shift Mode) ---
+    if is_multi_shift:
+        with tabs[2]:
+            st.subheader("📉 Layer-to-Layer Shift Trend")
+            trend_list = []
+            for src in df['SOURCE_FILE'].unique():
+                src_df = df[df['SOURCE_FILE'] == src]
+                base = src_df[src_df['L_NUM'] == 0][['P_ID', 'X_VAL', 'Y_VAL']]
                 for lyr in sorted(df['L_NUM'].unique()):
                     if lyr == 0: continue
-                    target = src_df[src_df['L_NUM'] == lyr][['ID', 'X_VAL', 'Y_VAL']]
-                    m = pd.merge(base, target, on='ID', suffixes=('_0', '_L'))
-                    if not m.empty:
-                        trend_data.append({'Source': src, 'Layer': lyr, 
-                                           'DX': (m['X_VAL_L'] - m['X_VAL_0']).mean(),
-                                           'DY': (m['Y_VAL_L'] - m['Y_VAL_0']).mean()})
-            if trend_data:
-                tdf = pd.DataFrame(trend_data)
-                fig = px.line(tdf, x='DX', y='Layer', color='Source', markers=True, title="X-Shift Trend")
-                st.plotly_chart(fig, use_container_width=True)
+                    target = src_df[src_df['L_NUM'] == lyr][['P_ID', 'X_VAL', 'Y_VAL']]
+                    merged = pd.merge(base, target, on='P_ID', suffixes=('_0', '_L'))
+                    if not merged.empty:
+                        trend_list.append({'Source': src, 'Layer': lyr, 
+                                           'DX': (merged['X_VAL_L'] - merged['X_VAL_0']).mean(),
+                                           'DY': (merged['Y_VAL_L'] - merged['Y_VAL_0']).mean()})
+            if trend_list:
+                tdf = pd.DataFrame(trend_list)
+                c1, c2 = st.columns(2)
+                with c1:
+                    fig_x = px.line(tdf, x='DX', y='Layer', color='Source', markers=True, title="Average X-Shift by Layer")
+                    if use_manual_axis: fig_x.update_xaxes(range=[v_min, v_max])
+                    st.plotly_chart(fig_x, use_container_width=True)
+                with c2:
+                    fig_y = px.line(tdf, x='DY', y='Layer', color='Source', markers=True, title="Average Y-Shift by Layer")
+                    if use_manual_axis: fig_y.update_xaxes(range=[v_min, v_max])
+                    st.plotly_chart(fig_y, use_container_width=True)
 
-    # --- 공통 탭: 3D View ---
+    # --- Tab: Pitch Analysis ---
+    pitch_tab_idx = 3 if is_multi_shift else 2
+    with tabs[pitch_tab_idx]:
+        st.subheader("🎯 Pitch Analysis (X & Y)")
+        col_px, col_py = st.columns(2)
+        with col_px:
+            fig, ax = plt.subplots(figsize=(8, 5))
+            sns.boxplot(data=df, x='SOURCE_FILE', y='X_PITCH', hue='L_NUM', ax=ax)
+            ax.set_title("X-Pitch Distribution")
+            st.pyplot(fig)
+        with col_py:
+            fig, ax = plt.subplots(figsize=(8, 5))
+            sns.boxplot(data=df, x='SOURCE_FILE', y='Y_PITCH', hue='L_NUM', ax=ax)
+            ax.set_title("Y-Pitch Distribution")
+            st.pyplot(fig)
+
+    # --- Tab: 3D View ---
     with tabs[-1]:
-        st.subheader("🧊 3D Stack View")
-        fig = px.scatter_3d(df, x='X_VAL', y='Y_VAL', z='Z_VAL', color='VALUE', 
-                            opacity=0.7, color_continuous_scale='Turbo')
-        fig.update_layout(height=700); st.plotly_chart(fig, use_container_width=True)
+        st.subheader("🧊 3D Stacked View")
+        fig_3d = px.scatter_3d(df, x='X_VAL', y='Y_VAL', z='Z_VAL', color='TARGET_VAL',
+                               opacity=0.7, color_continuous_scale='Turbo', hover_data=['P_ID', 'L_NUM'])
+        fig_3d.update_layout(height=800)
+        st.plotly_chart(fig_3d, use_container_width=True)
 
 else:
-    st.info("파일을 업로드하면 자동으로 모드를 분석하여 대시보드를 생성합니다.")
+    st.info("Please upload CSV files to start analysis.")
