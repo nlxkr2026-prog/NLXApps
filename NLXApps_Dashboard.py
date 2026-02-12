@@ -9,7 +9,6 @@ import os
 
 # --- [1] 데이터 전처리 및 정밀 Pitch 계산 로직 ---
 def process_data(df, scale_factor, apply_iqr):
-    # 컬럼명 표준화 (공백 제거 및 대문자화)
     df.columns = [c.strip().upper() for c in df.columns]
     
     # 1. 데이터 타입 판별
@@ -32,9 +31,8 @@ def process_data(df, scale_factor, apply_iqr):
         df[col + '_UM'] = df[col] * scale_factor
     df['MEAS_VALUE'] = df[target_cols[0] + '_UM']
 
-    # 3. 레이어 번호 설정 (Pitch 계산 전 필수)
-    if 'LAYER_NUMBER' in df.columns:
-        df['L_NUM'] = df['LAYER_NUMBER'].astype(int)
+    # 3. 레이어 설정
+    if 'LAYER_NUMBER' in df.columns: df['L_NUM'] = df['LAYER_NUMBER'].astype(int)
     elif 'BUMP_CENTER_Z' in df.columns:
         z_vals = np.sort(df['BUMP_CENTER_Z'].unique())
         if len(z_vals) > 1:
@@ -47,34 +45,40 @@ def process_data(df, scale_factor, apply_iqr):
         else: df['L_NUM'] = 0
     else: df['L_NUM'] = 0
 
-    # 4. [핵심] 개선된 Pitch 알고리즘 (GroupID 연속성 및 좌표 그룹화 반영)
-    group_base = ['SOURCE_FILE', 'L_NUM'] if 'SOURCE_FILE' in df.columns else ['L_NUM']
+    # 4. [C] 양산형 Pitch 계산 (보여주신 로직 + GroupID 브레이크 추가)
     df['P_ID'] = df['GROUP_ID'] if 'GROUP_ID' in df.columns else df.index
+    group_base = ['SOURCE_FILE', 'L_NUM'] if 'SOURCE_FILE' in df.columns else ['L_NUM']
 
-    # [X-Pitch] 동일 레이어 내에서 Y좌표가 거의 같은 범프들을 한 줄로 인식
-    # 소수점 셋째 자리까지 일치하면 동일 행으로 간주하여 정밀도 향상
-    df['Y_ROUND'] = df['Y_VAL'].round(3)
-    df = df.sort_values(group_base + ['Y_ROUND', 'X_VAL'])
-    
-    # GroupID가 1씩 증가할 때만 인접 범프로 간주하여 X 차이 계산
-    df['ID_STEP'] = df.groupby(group_base + ['Y_ROUND'])['P_ID'].diff()
-    df['X_PITCH'] = np.where(df['ID_STEP'] == 1, df.groupby(group_base + ['Y_ROUND'])['X_VAL'].diff().abs(), np.nan)
+    # X_Pitch 계산 (Y 그리드 기준 정렬)
+    df['Y_GRID'] = df['Y_VAL'].round(3) # 정밀도 조정
+    df = df.sort_values(by=group_base + ['Y_GRID', 'X_VAL'])
+    # ID가 연속적(차이가 1)인 경우만 Pitch로 인정 (행 바뀜 방지)
+    df['ID_DIFF'] = df.groupby(group_base + ['Y_GRID'])['P_ID'].diff()
+    df['X_PITCH'] = np.where(df['ID_DIFF'] == 1, df.groupby(group_base + ['Y_GRID'])['X_VAL'].diff().abs(), np.nan)
 
-    # [Y-Pitch] X좌표가 거의 같은 범프들을 한 열로 인식
-    df['X_ROUND'] = df['X_VAL'].round(3)
-    df = df.sort_values(group_base + ['X_ROUND', 'Y_VAL'])
-    # 열 방향은 ID가 건너뛰는 경우가 많으므로 좌표 차이 기반으로 인접성 판단 (예: 50um 이내)
-    df['Y_PITCH_RAW'] = df.groupby(group_base + ['X_ROUND'])['Y_VAL'].diff().abs()
-    df['Y_PITCH'] = np.where(df['Y_PITCH_RAW'] < 50, df['Y_PITCH_RAW'], np.nan) # 50um 이상은 행 바뀜으로 간주
+    # Y_Pitch 계산 (X 그리드 기준 정렬)
+    df['X_GRID'] = df['X_VAL'].round(3)
+    df = df.sort_values(by=group_base + ['X_GRID', 'Y_VAL'])
+    df['Y_PITCH'] = df.groupby(group_base + ['X_GRID'])['Y_VAL'].diff().abs()
 
-    # 5. IQR 필터링 (최종 결과값 정제)
-    df_clean = df.copy()
+    # [D] Pitch 이상치 제거 (보여주신 IQR 로직 적용)
+    for col in ['X_PITCH', 'Y_PITCH']:
+        valid_p = df[col].dropna()
+        if not valid_p.empty:
+            q1, q3 = valid_p.quantile([0.25, 0.75])
+            iqr_p = q3 - q1
+            lower_p, upper_p = q1 - 1.5 * iqr_p, q3 + 1.5 * iqr_p
+            df.loc[(df[col] < lower_p) | (df[col] > upper_p), col] = np.nan
+
+    # 5. [B] 측정값 이상치 제거 (보여주신 로직 적용)
+    df_clean = df[df['MEAS_VALUE'] != 0].copy()
     if apply_iqr and d_type != "Coordinate":
-        df_clean = df_clean[df_clean['MEAS_VALUE'] != 0]
-        if not df_clean.empty:
-            q1, q3 = df_clean['MEAS_VALUE'].quantile([0.25, 0.75])
-            iqr = q3 - q1
-            df_clean = df_clean[(df_clean['MEAS_VALUE'] >= q1 - 1.5 * iqr) & (df_clean['MEAS_VALUE'] <= q3 + 1.5 * iqr)]
+        qh1, qh3 = df_clean['MEAS_VALUE'].quantile([0.25, 0.75])
+        iqr_h = qh3 - qh1
+        df_clean = df_clean[
+            (df_clean['MEAS_VALUE'] >= qh1 - 1.5 * iqr_h) & 
+            (df_clean['MEAS_VALUE'] <= qh3 + 1.5 * iqr_h)
+        ]
 
     return df_clean, d_type
 
@@ -97,7 +101,6 @@ st.title("🔬 NLX Bump Analysis Dashboard")
 with st.sidebar:
     st.header("📁 Data Config")
     uploaded_files = st.file_uploader("Upload CSV Files", type=['csv'], accept_multiple_files=True)
-    # 버튼 없이 입력만 받는 형식
     scale = st.number_input("Multiplier (Scale Factor)", value=1.0, format="%.4f")
     use_iqr = st.checkbox("Apply IQR Filter", value=True)
 
@@ -110,17 +113,13 @@ with st.sidebar:
 
     with st.expander("📏 Legend & Scale Control", expanded=False):
         show_legend = st.checkbox("Show Legend", value=True)
-        global_legend_loc = st.selectbox("Legend Loc", 
-            options=["best", "upper right", "upper left", "lower left", "lower right", "right", "center left", "center right", "lower center", "upper center", "center"], 
-            index=1, disabled=not show_legend)
-        st.markdown("---")
+        global_legend_loc = st.selectbox("Legend Loc", options=["best", "upper right", "upper left", "lower left", "lower right", "right"], index=1)
         use_custom_scale = st.checkbox("Manual Axis Range", value=False)
         v_min = st.number_input("Min Limit", value=-10.0)
         v_max = st.number_input("Max Limit", value=10.0)
 
     with st.expander("🧊 3D & Outlier Settings", expanded=False):
         color_option = st.selectbox("Color Theme", ["Viridis", "Plasma", "Jet", "Turbo"])
-        st.markdown("---")
         use_outlier_filter = st.checkbox("Highlight Outliers")
         outlier_low = st.number_input("Lower Bound (Yellow)", value=-5.0)
         outlier_high = st.number_input("Upper Bound (Red)", value=5.0)
@@ -139,17 +138,16 @@ if uploaded_files:
         unique_layers = sorted(combined_df['L_NUM'].unique())
 
         st.markdown("### 📋 Quick Summary")
-        m_col1, m_col2, m_col3, m_col4 = st.columns(4)
-        avg_val, std_val = combined_df['MEAS_VALUE'].mean(), combined_df['MEAS_VALUE'].std()
-        m_col1.metric("Global Average", f"{avg_val:.3f} um")
-        m_col2.metric("Global 3-Sigma", f"{(std_val * 3):.3f} um")
-        m_col3.metric("Max-Min Range", f"{(combined_df['MEAS_VALUE'].max() - combined_df['MEAS_VALUE'].min()):.3f} um")
-        m_col4.metric("Total Bumps", f"{len(combined_df):,}")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Global Average", f"{combined_df['MEAS_VALUE'].mean():.3f} um")
+        m2.metric("Global 3-Sigma", f"{(combined_df['MEAS_VALUE'].std()*3):.3f} um")
+        m3.metric("Max-Min Range", f"{(combined_df['MEAS_VALUE'].max()-combined_df['MEAS_VALUE'].min()):.3f} um")
+        m4.metric("Total Bumps", f"{len(combined_df):,}")
 
         with st.expander("📄 View File-wise Detailed Statistics"):
-            file_stats = combined_df.groupby('SOURCE_FILE')['MEAS_VALUE'].agg(['mean', 'std', 'min', 'max', 'count']).reset_index()
-            file_stats['3-Sigma'] = file_stats['std'] * 3
-            st.dataframe(file_stats.style.format(precision=3), use_container_width=True)
+            stats = combined_df.groupby('SOURCE_FILE')['MEAS_VALUE'].agg(['mean', 'std', 'min', 'max', 'count']).reset_index()
+            stats['3-Sigma'] = stats['std'] * 3
+            st.dataframe(stats.style.format(precision=3), use_container_width=True)
         
         st.markdown("---")
         tabs = st.tabs(["📊 Single Layer", "📈 Comparison", "📉 Shift Trend", "🧊 3D View", "🎯 Pitch Analysis"])
@@ -217,21 +215,19 @@ if uploaded_files:
             st.subheader("🎯 Pitch Analysis (X & Y Distribution)")
             col_p1, col_p2 = st.columns(2)
             with col_p1:
-                st.markdown("**X-Pitch Analysis (Between Columns)**")
+                st.markdown("**X-Pitch Analysis (Column-to-Column)**")
                 fig_px, ax_px = plt.subplots(figsize=(p_w/2, p_h))
                 sns.boxplot(data=combined_df, x='SOURCE_FILE', y='X_PITCH', hue='SOURCE_FILE', ax=ax_px, palette='Blues')
                 apply_global_legend(ax_px, global_legend_loc, show_legend); st.pyplot(fig_px)
-                
                 fig_hx, ax_hx = plt.subplots(figsize=(p_w/2, p_h))
                 sns.histplot(data=combined_df, x='X_PITCH', hue='SOURCE_FILE', kde=True, ax=ax_hx)
                 apply_global_legend(ax_hx, global_legend_loc, show_legend); st.pyplot(fig_hx)
 
             with col_p2:
-                st.markdown("**Y-Pitch Analysis (Between Rows)**")
+                st.markdown("**Y-Pitch Analysis (Row-to-Row)**")
                 fig_py, ax_py = plt.subplots(figsize=(p_w/2, p_h))
                 sns.boxplot(data=combined_df, x='SOURCE_FILE', y='Y_PITCH', hue='SOURCE_FILE', ax=ax_py, palette='Reds')
                 apply_global_legend(ax_py, global_legend_loc, show_legend); st.pyplot(fig_py)
-
                 fig_hy, ax_hy = plt.subplots(figsize=(p_w/2, p_h))
                 sns.histplot(data=combined_df, x='Y_PITCH', hue='SOURCE_FILE', kde=True, ax=ax_hy)
                 apply_global_legend(ax_hy, global_legend_loc, show_legend); st.pyplot(fig_hy)
