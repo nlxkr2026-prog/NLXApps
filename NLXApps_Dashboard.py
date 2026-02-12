@@ -6,17 +6,16 @@ import seaborn as sns
 import plotly.express as px
 import os
 
-# --- [1] 데이터 전처리 엔진 (mm/um 대응 및 지능형 레이어링) ---
+# --- [1] 데이터 전처리 엔진 ---
 def process_data(files, multiplier, layer_gap):
     all_dfs = []
     for f in files:
         df = pd.read_csv(f)
         df.columns = [c.strip().upper() for c in df.columns]
         
-        # 좌표 표준화 (Multiplier 적용)
+        # 1. 좌표 표준화 (Multiplier 적용)
         x_col = next((c for c in ['X_COORD', 'BUMP_CENTER_X'] if c in df.columns), None)
         y_col = next((c for c in ['Y_COORD', 'BUMP_CENTER_Y'] if c in df.columns), None)
-        # Z축 후보: Z_COORD -> BUMP_CENTER_Z -> INTERSECTION_HEIGHT (Radii 데이터 대응)
         z_col = next((c for c in ['Z_COORD', 'BUMP_CENTER_Z', 'INTERSECTION_HEIGHT'] if c in df.columns), None)
 
         if x_col: df['X_VAL'] = df[x_col] * multiplier
@@ -26,7 +25,7 @@ def process_data(files, multiplier, layer_gap):
         if z_col: df['Z_VAL'] = df[z_col] * multiplier
         else: df['Z_VAL'] = 0
         
-        # 레이어 구분 로직
+        # 2. 레이어 구분 로직 (사용자 설정 Gap 적용)
         if 'LAYER_NUMBER' in df.columns:
             df['L_NUM'] = df['LAYER_NUMBER'].fillna(0).astype(int)
         else:
@@ -37,9 +36,10 @@ def process_data(files, multiplier, layer_gap):
                 l_assign = np.zeros(len(df), dtype=int)
                 for s in splits: l_assign[df['Z_VAL'] >= s] += 1
                 df['L_NUM'] = l_assign
-            else: df['L_NUM'] = 0
+            else:
+                df['L_NUM'] = 0
                 
-        # 고유 식별자 설정 (Pillar 우선)
+        # 3. 식별자 설정 (Pillar > Group)
         if 'PILLAR_NUMBER' in df.columns: df['P_ID'] = df['PILLAR_NUMBER']
         elif 'GROUP_ID' in df.columns: df['P_ID'] = df['GROUP_ID']
         else: df['P_ID'] = df.index
@@ -48,12 +48,12 @@ def process_data(files, multiplier, layer_gap):
         all_dfs.append(df)
     return pd.concat(all_dfs, ignore_index=True) if all_dfs else None
 
-# --- [2] Pitch 계산 로직 (통계 및 필터링) ---
+# --- [2] Pitch 계산 로직 ---
 def calculate_pitch(df, pitch_sens):
     grid_size = 1.0
     group_keys = ['SOURCE_NAME', 'L_NUM']
     
-    # X-Pitch
+    # X-Pitch (ID 연속성 및 통계 필터)
     df['Y_GRID'] = (df['Y_VAL'] / grid_size).round() * grid_size
     df = df.sort_values(by=group_keys + ['Y_GRID', 'X_VAL'])
     df['ID_STEP'] = df.groupby(group_keys + ['Y_GRID'])['P_ID'].diff()
@@ -94,8 +94,8 @@ with st.sidebar:
         combined_df = process_data(uploaded_files, multiplier, layer_gap)
         combined_df['SOURCE_NAME'] = combined_df['ORIG_SOURCE'].map(custom_names)
         
-        # 분석 지표 자동 추출
-        exclude = ['X_VAL', 'Y_VAL', 'Z_VAL', 'L_NUM', 'P_ID', 'SOURCE_NAME', 'ORIG_SOURCE', 'Y_GRID', 'X_GRID', 'ID_STEP', 'X_COORD', 'Y_COORD', 'Z_COORD', 'PILLAR_NUMBER', 'LAYER_NUMBER', 'GROUP_ID', 'INTERSECTION_HEIGHT', 'ID_DIFF', 'X_PITCH', 'Y_PITCH', 'VALUE', 'STATUS']
+        # 분석 지표 자동 추출 (좌표값도 선택할 수 있게 일부 포함)
+        exclude = ['L_NUM', 'P_ID', 'SOURCE_NAME', 'ORIG_SOURCE', 'Y_GRID', 'X_GRID', 'ID_STEP', 'PILLAR_NUMBER', 'LAYER_NUMBER', 'GROUP_ID', 'X_COORD', 'Y_COORD', 'Z_COORD']
         available_metrics = [c for c in combined_df.columns if c not in exclude and combined_df[c].dtype in [np.float64, np.int64]]
         target_col = st.selectbox("🎯 Target Measurement", available_metrics if available_metrics else ["None"])
         
@@ -109,34 +109,51 @@ with st.sidebar:
         st.markdown("---")
         st.subheader("🧊 3D Highlight Settings")
         use_outlier_3d = st.checkbox("Highlight 3D Outliers", value=False)
-        out_low, out_high = st.number_input("3D Under (Yellow)", value=-5.0), st.number_input("3D Over (Red)", value=5.0)
+        out_low = st.number_input("3D Under (Yellow)", value=-5.0)
+        out_high = st.number_input("3D Over (Red)", value=5.0)
+
+        st.markdown("---")
+        use_iqr = st.checkbox("Apply Global IQR Filter", value=True)
+        pitch_sens = st.slider("Pitch Outlier Sensitivity", 0.5, 3.0, 1.2)
+        leg_loc = st.selectbox("Legend Location", ["best", "upper right", "right", "center"])
 
 if uploaded_files and combined_df is not None:
     df = combined_df.copy()
     if target_col != "None":
         df['VALUE'] = df[target_col] * multiplier
-        # Global IQR 필터링
-        q1, q3 = df['VALUE'].quantile([0.25, 0.75])
-        df = df[(df['VALUE'] >= q1 - 1.5*(q3-q1)) & (df['VALUE'] <= q3 + 1.5*(q3-q1))]
+        if use_iqr:
+            q1, q3 = df['VALUE'].quantile([0.25, 0.75])
+            df = df[(df['VALUE'] >= q1 - 1.5*(q3-q1)) & (df['VALUE'] <= q3 + 1.5*(q3-q1))]
     
-    df = calculate_pitch(df, 1.2)
-    is_multi_shift = 'X_COORD' in df.columns and 'PILLAR_NUMBER' in df.columns
+    df = calculate_pitch(df, pitch_sens)
+    
+    # 모드 판별 (X_COORD와 Pillar가 있는 다층 데이터)
+    is_multi_shift = ('X_VAL' in df.columns or 'X_COORD' in df.columns) and 'PILLAR_NUMBER' in combined_df.columns.upper() and df['L_NUM'].nunique() > 1
     
     tabs = st.tabs(["📊 Statistics", "📈 Comparison", "📉 Shift Trend", "🎯 Pitch Analysis", "🧊 3D View"])
 
     # --- Tab 0: Statistics ---
     with tabs[0]:
-        lyr_sel = st.selectbox("Statistics Layer", ["All"] + [f"Layer {i}" for i in sorted(df['L_NUM'].unique())])
+        lyr_sel = st.selectbox("Statistics Layer Selection", ["All"] + [f"Layer {i}" for i in sorted(df['L_NUM'].unique())])
         pdf = df if lyr_sel == "All" else df[df['L_NUM'] == int(lyr_sel.split(" ")[1])]
         fig, ax = plt.subplots(figsize=(10, 5))
         sns.histplot(data=pdf, x='VALUE', hue='SOURCE_NAME', kde=True, ax=ax)
         if use_manual_scale: ax.set_xlim(v_min, v_max)
         ax.set_xlabel(custom_x_name); st.pyplot(fig)
 
+    # --- Tab 1: Comparison (복구 완료) ---
+    with tabs[1]:
+        st.subheader(f"Layer-wise {target_col} Comparison")
+        fig, ax = plt.subplots(figsize=(12, 6))
+        sns.boxplot(data=df, x='L_NUM', y='VALUE', hue='SOURCE_NAME', ax=ax)
+        if use_manual_scale: ax.set_ylim(v_min, v_max)
+        ax.set_ylabel(custom_y_name); ax.set_xlabel("Layer Number")
+        ax.legend(loc=leg_loc); st.pyplot(fig)
+
     # --- Tab 2: Shift Trend (X축: Shift, Y축: Layer) ---
     with tabs[2]:
         if not is_multi_shift:
-            st.warning("Trend 분석은 'X_COORD'와 'PILLAR_NUMBER'가 포함된 데이터 전용입니다.")
+            st.warning("Trend 분석은 'X_COORD'와 'PILLAR_NUMBER'가 포함된 다층 데이터 전용입니다.")
         else:
             trend_list = []
             for src in df['SOURCE_NAME'].unique():
@@ -150,18 +167,18 @@ if uploaded_files and combined_df is not None:
                         trend_list.append({'Source': src, 'Layer': lyr, 'DX': (m['X_VAL_L'] - m['X_VAL_0']).mean(), 'DY': (m['Y_VAL_L'] - m['Y_VAL_0']).mean()})
             if trend_list:
                 tdf = pd.DataFrame(trend_list)
-                mode = st.radio("Shift Axis", ["X & Y", "X Only", "Y Only"], horizontal=True)
-                fig_trend = px.line(tdf, y='Layer', markers=True, title="Relative Layer Shift from L0")
+                mode = st.radio("Shift Axis View", ["X & Y", "X Only", "Y Only"], horizontal=True)
+                fig_trend = px.line(tdf, y='Layer', markers=True, title="Relative Layer Shift Trend (Base: L0)")
                 if mode in ["X & Y", "X Only"]: fig_trend.add_scatter(x=tdf['DX'], y=tdf['Layer'], name="DX (Shift X)")
                 if mode in ["X & Y", "Y Only"]: fig_trend.add_scatter(x=tdf['DY'], y=tdf['Layer'], name="DY (Shift Y)")
-                fig_trend.update_layout(xaxis_title="Average Shift (um)", yaxis_title="Layer Number")
+                fig_trend.update_layout(xaxis_title="Average Displacement (um)", yaxis_title="Layer Number")
                 if use_manual_scale: fig_trend.update_xaxes(range=[v_min, v_max])
                 st.plotly_chart(fig_trend, use_container_width=True)
 
-    # --- Tab 3: Pitch Analysis (통계 및 레이어 선택) ---
+    # --- Tab 3: Pitch Analysis (통계 테이블 & 레이어 선택 추가) ---
     with tabs[3]:
         st.subheader("🎯 Bump Pitch Analysis")
-        lyr_p = st.selectbox("Pitch Layer View", ["All"] + [f"Layer {i}" for i in sorted(df['L_NUM'].unique())])
+        lyr_p = st.selectbox("Pitch Analysis Layer Selection", ["All"] + [f"Layer {i}" for i in sorted(df['L_NUM'].unique())])
         p_df = df if lyr_p == "All" else df[df['L_NUM'] == int(lyr_p.split(" ")[1])]
         c1, c2 = st.columns(2)
         with c1:
@@ -170,10 +187,11 @@ if uploaded_files and combined_df is not None:
         with c2:
             fig, ax = plt.subplots(); sns.boxplot(data=p_df, x='SOURCE_NAME', y='Y_PITCH', hue='L_NUM', ax=ax)
             ax.set_title("Y-Pitch"); st.pyplot(fig)
-        st.markdown("**Pitch Summary Stats**")
+        
+        st.markdown("**Pitch Summary Statistics**")
         st.dataframe(p_df.groupby(['SOURCE_NAME', 'L_NUM'])[['X_PITCH', 'Y_PITCH']].agg(['mean', 'std', 'count']).style.format("{:.3f}"), use_container_width=True)
 
-    # --- Tab 4: 3D View (Highlight 기능) ---
+    # --- Tab 4: 3D View (Highlight 복구) ---
     with tabs[4]:
         st.subheader("🧊 Interactive 3D Stack View")
         plot_3d = df.copy()
@@ -187,4 +205,4 @@ if uploaded_files and combined_df is not None:
         fig_3d.update_layout(height=800); st.plotly_chart(fig_3d, use_container_width=True)
 
 else:
-    st.info("CSV 파일을 업로드하면 자동으로 분석 모드를 설정합니다.")
+    st.info("CSV 파일을 업로드하면 분석이 시작됩니다.")
