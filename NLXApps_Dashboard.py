@@ -9,8 +9,10 @@ import os
 
 # --- [1] 데이터 전처리 로직 ---
 def process_data(df, scale_factor, apply_iqr):
+    # 컬럼명 대문자 표준화
     df.columns = [c.strip().upper() for c in df.columns]
     
+    # 1. 데이터 타입 판별 및 타겟 설정
     d_type = None
     target_cols = []
     
@@ -27,14 +29,17 @@ def process_data(df, scale_factor, apply_iqr):
         d_type, target_cols = "Coordinate", ['X_COORD']
     else: return None, None
 
+    # 2. 좌표 및 측정값 설정 (입력받은 scale_factor 곱함)
     df['X_VAL'] = (df['X_COORD'] if 'X_COORD' in df.columns else df.get('BUMP_CENTER_X', 0)) * scale_factor
     df['Y_VAL'] = (df['Y_COORD'] if 'Y_COORD' in df.columns else df.get('BUMP_CENTER_Y', 0)) * scale_factor
     
     for col in target_cols:
         df[col + '_UM'] = df[col] * scale_factor
     
+    # 기본 메인 값 설정
     df['MEAS_VALUE'] = df[target_cols[0] + '_UM']
     
+    # 3. 레이어 번호 설정
     if 'LAYER_NUMBER' in df.columns:
         df['L_NUM'] = df['LAYER_NUMBER'].astype(int)
     elif 'BUMP_CENTER_Z' in df.columns:
@@ -53,6 +58,7 @@ def process_data(df, scale_factor, apply_iqr):
 
     df['P_ID'] = df['PILLAR_NUMBER'] if 'PILLAR_NUMBER' in df.columns else (df['GROUP_ID'] if 'GROUP_ID' in df.columns else None)
 
+    # 5. IQR 필터링
     df_clean = df.copy()
     if apply_iqr and d_type != "Coordinate":
         df_clean = df_clean[df_clean['MEAS_VALUE'] != 0]
@@ -80,20 +86,21 @@ def apply_global_legend(ax, loc, show_legend):
 st.set_page_config(page_title="NLX Multi-Layer Professional", layout="wide")
 st.title("🔬 NLX Bump Analysis Dashboard")
 
-# --- 사이드바 최적화 (그룹화 및 크기 축소 효과) ---
+# --- 사이드바 최적화 ---
 with st.sidebar:
     st.header("📁 Data Config")
     uploaded_files = st.file_uploader("Upload CSV Files", type=['csv'], accept_multiple_files=True)
     
-    c1, c2 = st.columns(2)
-    with c1: scale = st.number_input("Scale", value=1.0, step=0.1)
-    with c2: use_iqr = st.checkbox("IQR Filter", value=True)
+    # [수정] 데이터 배수 곱하기 옵션 (Global Scale Factor) 강화
+    scale = st.number_input("Data Multiplier (e.g. 1000 for mm to um)", value=1.0, step=0.1, help="모든 좌표 및 측정값에 이 값을 곱합니다.")
+    use_iqr = st.checkbox("Apply IQR Filter", value=True)
 
     with st.expander("🎨 Plot Settings", expanded=True):
-        p_multiplier = st.slider("Plot Scale", 0.5, 3.0, 1.0, 0.1)
-        p_w, p_h = 10 * p_multiplier, 6 * p_multiplier
+        # [수정] Plot Scale 삭제 및 개별 가로/세로 조절 복구
+        p_w = st.slider("Plot Width", 5, 25, 12)
+        p_h = st.slider("Plot Height", 3, 15, 6)
         
-        custom_title = st.text_input("Title", "Alignment Analysis")
+        custom_title = st.text_input("Graph Title", "Alignment Analysis")
         x_lbl = st.text_input("X Axis Label", "X Position (um)")
         y_lbl = st.text_input("Y Axis Label", "Y Position (um)")
 
@@ -105,8 +112,8 @@ with st.sidebar:
         
         st.markdown("---")
         use_custom_scale = st.checkbox("Manual Axis Range", value=False)
-        v_min = st.number_input("Min", value=-10.0)
-        v_max = st.number_input("Max", value=10.0)
+        v_min = st.number_input("Min Limit", value=-10.0)
+        v_max = st.number_input("Max Limit", value=10.0)
 
     with st.expander("🧊 3D & Outlier Settings", expanded=False):
         color_option = st.selectbox("Color Theme", ["Viridis", "Plasma", "Inferno", "Magma", "Jet", "Turbo"])
@@ -133,9 +140,9 @@ if uploaded_files:
         m_col1, m_col2, m_col3, m_col4 = st.columns(4)
         avg_val, std_val = combined_df['MEAS_VALUE'].mean(), combined_df['MEAS_VALUE'].std()
         
-        m_col1.metric("Global Avg", f"{avg_val:.3f} um")
-        m_col2.metric("Global 3-Sigma", f"{(std_val * 3):.3f} um")
-        m_col3.metric("Max-Min Range", f"{(combined_df['MEAS_VALUE'].max() - combined_df['MEAS_VALUE'].min()):.3f} um")
+        m_col1.metric("Global Avg", f"{avg_val:.3f}")
+        m_col2.metric("Global 3-Sigma", f"{(std_val * 3):.3f}")
+        m_col3.metric("Max-Min Range", f"{(combined_df['MEAS_VALUE'].max() - combined_df['MEAS_VALUE'].min()):.3f}")
         m_col4.metric("Total Bumps", f"{len(combined_df):,}")
 
         with st.expander("📄 Detailed Statistics by File"):
@@ -163,7 +170,7 @@ if uploaded_files:
             if chart_type == "Heatmap":
                 sc = ax1.scatter(display_df['X_VAL'], display_df['Y_VAL'], c=display_df[active_target], cmap='jet', s=15)
                 if use_custom_scale: sc.set_clim(v_min, v_max)
-                plt.colorbar(sc, label="um")
+                plt.colorbar(sc)
             elif chart_type == "Box Plot":
                 sns.boxplot(data=display_df, x='SOURCE_FILE', y=active_target, hue='SOURCE_FILE', ax=ax1, palette='Set2')
                 if use_custom_scale: ax1.set_ylim(v_min, v_max)
@@ -213,18 +220,13 @@ if uploaded_files:
             st.subheader("Interactive 3D Layer Stack View")
             plot_3d_df = combined_df.copy()
             if use_outlier_filter:
-                # [수정] 이상치 분류 로직 강화: 하한(노란색), 상한(빨간색), 정상(파란색)
-                conditions = [
-                    (plot_3d_df['MEAS_VALUE'] < outlier_low),
-                    (plot_3d_df['MEAS_VALUE'] > outlier_high)
-                ]
+                conditions = [(plot_3d_df['MEAS_VALUE'] < outlier_low), (plot_3d_df['MEAS_VALUE'] > outlier_high)]
                 choices = ['Under Limit (Low)', 'Over Limit (High)']
                 plot_3d_df['Status'] = np.select(conditions, choices, default='Normal')
                 
                 fig_3d = px.scatter_3d(
                     plot_3d_df, x='X_VAL', y='Y_VAL', z='L_NUM',
                     color='Status',
-                    # 노란색, 빨간색, 파란색 매핑
                     color_discrete_map={'Under Limit (Low)': 'yellow', 'Over Limit (High)': 'red', 'Normal': 'blue'},
                     opacity=0.6, labels={'X_VAL': 'X', 'Y_VAL': 'Y', 'L_NUM': 'Layer'},
                     title=f"3D Outlier Highlight: {custom_title}"
