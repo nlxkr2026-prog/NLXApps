@@ -105,6 +105,20 @@ global_legend_loc = st.sidebar.selectbox(
     disabled=not show_legend
 )
 
+st.sidebar.markdown("---")
+st.sidebar.subheader("📏 Scale Settings")
+use_custom_scale = st.sidebar.checkbox("Apply Custom Scale Range", value=False)
+v_min = st.sidebar.number_input("Min Limit", value=-10.0)
+v_max = st.sidebar.number_input("Max Limit", value=10.0)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("🧊 3D View Settings")
+color_option = st.sidebar.selectbox("3D Color Scale", ["Viridis", "Plasma", "Inferno", "Magma", "Jet", "Turbo"])
+st.sidebar.write("**Outlier Highlight (Red)**")
+use_outlier_filter = st.sidebar.checkbox("Highlight Values Outside Range")
+outlier_min = st.sidebar.number_input("Outlier Lower Bound", value=-5.0)
+outlier_max = st.sidebar.number_input("Outlier Upper Bound", value=5.0)
+
 if uploaded_files:
     all_data = []
     for file in uploaded_files:
@@ -118,7 +132,6 @@ if uploaded_files:
         combined_df = pd.concat(all_data)
         unique_layers = sorted(combined_df['L_NUM'].unique())
 
-        # --- [기능 1] Summary Dashboard (상단 메트릭 및 파일별 통계) ---
         st.markdown("### 📋 Quick Summary")
         m_col1, m_col2, m_col3, m_col4 = st.columns(4)
         avg_val = combined_df['MEAS_VALUE'].mean()
@@ -130,12 +143,10 @@ if uploaded_files:
         m_col3.metric("Global Max-Min", f"{(combined_df['MEAS_VALUE'].max() - combined_df['MEAS_VALUE'].min()):.3f} um")
         m_col4.metric("Total Bumps", f"{count_val:,}")
 
-        # [신규 추가] 파일별 상세 통계 테이블
         with st.expander("📄 View File-wise Detailed Statistics", expanded=True):
             file_stats = combined_df.groupby('SOURCE_FILE')['MEAS_VALUE'].agg(['mean', 'std', 'min', 'max', 'count']).reset_index()
             file_stats['3-Sigma'] = file_stats['std'] * 3
             file_stats.columns = ['File Name', 'Average (um)', 'Std Dev', 'Min', 'Max', 'Count', '3-Sigma (um)']
-            # 주요 지표 순서 재배치
             file_stats = file_stats[['File Name', 'Average (um)', '3-Sigma (um)', 'Min', 'Max', 'Count']]
             st.dataframe(file_stats.style.format(subset=['Average (um)', '3-Sigma (um)', 'Min', 'Max'], formatter="{:.3f}"), use_container_width=True)
         
@@ -161,12 +172,15 @@ if uploaded_files:
             
             if chart_type == "Heatmap":
                 sc = ax1.scatter(display_df['X_VAL'], display_df['Y_VAL'], c=display_df[active_target], cmap='jet', s=15)
+                if use_custom_scale: sc.set_clim(v_min, v_max)
                 plt.colorbar(sc, label=f"Value (um)")
             elif chart_type == "Box Plot":
                 sns.boxplot(data=display_df, x='SOURCE_FILE', y=active_target, hue='SOURCE_FILE', ax=ax1, palette='Set2')
+                if use_custom_scale: ax1.set_ylim(v_min, v_max)
                 apply_global_legend(ax1, global_legend_loc, show_legend)
             elif chart_type == "Histogram":
                 sns.histplot(data=display_df, x=active_target, hue='SOURCE_FILE', kde=True, ax=ax1)
+                if use_custom_scale: ax1.set_xlim(v_min, v_max)
                 apply_global_legend(ax1, global_legend_loc, show_legend)
             
             ax1.set_title(custom_title)
@@ -177,6 +191,7 @@ if uploaded_files:
             if len(unique_layers) > 1:
                 fig2, ax2 = plt.subplots(figsize=(p_w, p_h))
                 sns.boxplot(data=combined_df, x='L_NUM', y='MEAS_VALUE', hue='SOURCE_FILE', ax=ax2)
+                if use_custom_scale: ax2.set_ylim(v_min, v_max)
                 apply_global_legend(ax2, global_legend_loc, show_legend)
                 ax2.set_title(custom_title)
                 ax2.set_xlabel("Layer Number"); ax2.set_ylabel(f"{d_type} Value")
@@ -205,23 +220,42 @@ if uploaded_files:
                         data = trend_df[trend_df['Source'] == src]
                         ax3.plot(data['Avg_DX'], data['Layer'], marker='o', label=f"{src} (X)")
                         ax3.plot(data['Avg_DY'], data['Layer'], marker='s', ls='--', label=f"{src} (Y)")
+                    
+                    # [추가] Shift Trend X축 스케일 적용
+                    if use_custom_scale: ax3.set_xlim(v_min, v_max)
+                    
                     ax3.set_title(custom_title)
+                    ax3.set_xlabel("Average Shift (um)"); ax3.set_ylabel("Layer Number")
                     apply_global_legend(ax3, global_legend_loc, show_legend)
                     st.pyplot(fig3)
 
-        # --- [기능 2] 🧊 3D Visualization (Layer Stack) ---
         with tab4:
             st.subheader("Interactive 3D Layer Stack View")
-            fig_3d = px.scatter_3d(
-                combined_df, x='X_VAL', y='Y_VAL', z='L_NUM',
-                color='MEAS_VALUE', size_max=5, opacity=0.7,
-                color_continuous_scale='Viridis',
-                labels={'X_VAL': 'X (um)', 'Y_VAL': 'Y (um)', 'L_NUM': 'Layer'},
-                title=f"3D Distribution: {custom_title}"
-            )
+            plot_3d_df = combined_df.copy()
+            if use_outlier_filter:
+                plot_3d_df['Status'] = np.where(
+                    (plot_3d_df['MEAS_VALUE'] < outlier_min) | (plot_3d_df['MEAS_VALUE'] > outlier_max),
+                    'Outlier', 'Normal'
+                )
+                fig_3d = px.scatter_3d(
+                    plot_3d_df, x='X_VAL', y='Y_VAL', z='L_NUM',
+                    color='Status',
+                    color_discrete_map={'Outlier': 'red', 'Normal': 'blue'},
+                    opacity=0.6,
+                    labels={'X_VAL': 'X (um)', 'Y_VAL': 'Y (um)', 'L_NUM': 'Layer'},
+                    title=f"3D View with Outliers: {custom_title}"
+                )
+            else:
+                fig_3d = px.scatter_3d(
+                    plot_3d_df, x='X_VAL', y='Y_VAL', z='L_NUM',
+                    color='MEAS_VALUE', size_max=5, opacity=0.7,
+                    color_continuous_scale=color_option.lower(),
+                    labels={'X_VAL': 'X (um)', 'Y_VAL': 'Y (um)', 'L_NUM': 'Layer'},
+                    title=f"3D Distribution: {custom_title}"
+                )
+            
             fig_3d.update_layout(margin=dict(l=0, r=0, b=0, t=40), height=700)
             st.plotly_chart(fig_3d, use_container_width=True)
-            st.info("💡 마우스를 드래그하여 회전하거나, 스크롤하여 확대/축소할 수 있습니다.")
 
 else:
     st.info("Please upload CSV files to start analysis.")
