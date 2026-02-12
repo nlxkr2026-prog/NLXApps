@@ -3,11 +3,11 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-import plotly.express as px  # 3D 시각화용
+import plotly.express as px
 import io
 import os
 
-# --- [1] 데이터 전처리 및 Pitch 계산 로직 ---
+# --- [1] 데이터 전처리 및 정밀 Pitch 계산 로직 ---
 def process_data(df, scale_factor, apply_iqr):
     # 컬럼명 대문자 표준화
     df.columns = [c.strip().upper() for c in df.columns]
@@ -15,48 +15,23 @@ def process_data(df, scale_factor, apply_iqr):
     # 1. 데이터 타입 판별 및 타겟 설정
     d_type = None
     target_cols = []
-    
-    if 'HEIGHT' in df.columns: 
-        d_type, target_cols = "Height", ['HEIGHT']
-    elif 'RADIUS' in df.columns: 
-        d_type, target_cols = "Radius", ['RADIUS']
+    if 'HEIGHT' in df.columns: d_type, target_cols = "Height", ['HEIGHT']
+    elif 'RADIUS' in df.columns: d_type, target_cols = "Radius", ['RADIUS']
     elif 'SHIFT_NORM' in df.columns or 'SHIFT_X' in df.columns: 
         d_type = "Shift"
-        if 'SHIFT_NORM' in df.columns: target_cols.append('SHIFT_NORM')
-        if 'SHIFT_X' in df.columns: target_cols.append('SHIFT_X')
-        if 'SHIFT_Y' in df.columns: target_cols.append('SHIFT_Y')
-    elif 'X_COORD' in df.columns: 
-        d_type, target_cols = "Coordinate", ['X_COORD']
+        for c in ['SHIFT_NORM', 'SHIFT_X', 'SHIFT_Y']:
+            if c in df.columns: target_cols.append(c)
+    elif 'X_COORD' in df.columns: d_type, target_cols = "Coordinate", ['X_COORD']
     else: return None, None
 
-    # 2. 좌표 및 측정값 설정
+    # 2. 좌표 및 측정값 설정 (Multiplier 적용)
     df['X_VAL'] = (df['X_COORD'] if 'X_COORD' in df.columns else df.get('BUMP_CENTER_X', 0)) * scale_factor
     df['Y_VAL'] = (df['Y_COORD'] if 'Y_COORD' in df.columns else df.get('BUMP_CENTER_Y', 0)) * scale_factor
-    
     for col in target_cols:
         df[col + '_UM'] = df[col] * scale_factor
-    
     df['MEAS_VALUE'] = df[target_cols[0] + '_UM']
-    
-    # [Pitch 계산 알고리즘 - 행/열 바뀜 방지]
-    # X-Pitch: Y좌표가 같은 그룹(행) 내에서 X좌표 차이 계산
-    df['Y_GRID'] = df['Y_VAL'].round(1) 
-    df = df.sort_values(['SOURCE_FILE' if 'SOURCE_FILE' in df.columns else 'Y_GRID', 'Y_GRID', 'X_VAL'])
-    df['X_PITCH'] = df.groupby(['SOURCE_FILE' if 'SOURCE_FILE' in df.columns else 'Y_GRID', 'Y_GRID'])['X_VAL'].diff()
 
-    # Y-Pitch: X좌표가 같은 그룹(열) 내에서 Y좌표 차이 계산
-    df['X_GRID'] = df['X_VAL'].round(1)
-    df = df.sort_values(['SOURCE_FILE' if 'SOURCE_FILE' in df.columns else 'X_GRID', 'X_GRID', 'Y_VAL'])
-    df['Y_PITCH'] = df.groupby(['SOURCE_FILE' if 'SOURCE_FILE' in df.columns else 'X_GRID', 'X_GRID'])['Y_VAL'].diff()
-
-    # Pitch 이상치 제거 (인접하지 않은 Bump 간 계산 방지)
-    for p_col in ['X_PITCH', 'Y_PITCH']:
-        if not df[p_col].dropna().empty:
-            pq1, pq3 = df[p_col].quantile([0.25, 0.75])
-            piqr = pq3 - pq1
-            df.loc[(df[p_col] > pq3 + 1.5 * piqr), p_col] = np.nan
-
-    # 3. 레이어 번호 설정
+    # 3. 레이어 번호 설정 (Pitch 계산 전 필수 수행)
     if 'LAYER_NUMBER' in df.columns:
         df['L_NUM'] = df['LAYER_NUMBER'].astype(int)
     elif 'BUMP_CENTER_Z' in df.columns:
@@ -73,9 +48,30 @@ def process_data(df, scale_factor, apply_iqr):
     else:
         df['L_NUM'] = 0
 
-    df['P_ID'] = df['PILLAR_NUMBER'] if 'PILLAR_NUMBER' in df.columns else (df['GROUP_ID'] if 'GROUP_ID' in df.columns else None)
+    # 4. 개선된 Pitch 알고리즘 (Layer 및 Group_ID 연속성 반영)
+    # 식별자 설정
+    df['P_ID'] = df['GROUP_ID'] if 'GROUP_ID' in df.columns else (df['PILLAR_NUMBER'] if 'PILLAR_NUMBER' in df.columns else df.index)
+    group_base = ['SOURCE_FILE', 'L_NUM'] if 'SOURCE_FILE' in df.columns else ['L_NUM']
 
-    # 5. IQR 필터링
+    # [X-Pitch] 동일 레이어 내에서 Y좌표가 같은 그룹(행) 식별
+    df['Y_ROUND'] = (df['Y_VAL'] * 100).round() # 약 10um 오차 허용
+    df = df.sort_values(group_base + ['Y_ROUND', 'X_VAL'])
+    # ID가 연속적이고 동일 행일 때만 차이 계산
+    df['ID_DIFF'] = df.groupby(group_base + ['Y_ROUND'])['P_ID'].diff()
+    df['X_PITCH'] = np.where(df['ID_DIFF'] == 1, df.groupby(group_base + ['Y_ROUND'])['X_VAL'].diff().abs(), np.nan)
+
+    # [Y-Pitch] 동일 레이어 내에서 X좌표가 같은 그룹(열) 식별
+    df['X_ROUND'] = (df['X_VAL'] * 100).round()
+    df = df.sort_values(group_base + ['X_ROUND', 'Y_VAL'])
+    # ID가 비연속적인 구간(행 바뀜 등)은 계산 제외
+    df['Y_PITCH'] = df.groupby(group_base + ['X_ROUND'])['Y_VAL'].diff().abs()
+    
+    # 물리적 한계를 벗어나는 Pitch 필터링 (Noise 제거)
+    max_p = 50.0 # 공정에 맞춰 조절 가능
+    df.loc[df['X_PITCH'] > max_p, 'X_PITCH'] = np.nan
+    df.loc[df['Y_PITCH'] > max_p, 'Y_PITCH'] = np.nan
+
+    # 5. IQR 필터링 (측정값 기준)
     df_clean = df.copy()
     if apply_iqr and d_type != "Coordinate":
         df_clean = df_clean[df_clean['MEAS_VALUE'] != 0]
@@ -96,8 +92,7 @@ def apply_global_legend(ax, loc, show_legend):
         sns.move_legend(ax, loc=loc, title=None)
     except:
         handles, labels = ax.get_legend_handles_labels()
-        if handles:
-            ax.legend(handles=handles, labels=labels, loc=loc, title=None)
+        if handles: ax.legend(handles=handles, labels=labels, loc=loc, title=None)
 
 # --- [2] UI 구성 ---
 st.set_page_config(page_title="NLX Multi-Layer Professional", layout="wide")
@@ -128,7 +123,7 @@ with st.sidebar:
         v_max = st.number_input("Max Limit", value=10.0)
 
     with st.expander("🧊 3D & Outlier Settings", expanded=False):
-        color_option = st.selectbox("Color Theme", ["Viridis", "Plasma", "Inferno", "Magma", "Jet", "Turbo"])
+        color_option = st.selectbox("Color Theme", ["Viridis", "Plasma", "Jet", "Turbo"])
         st.markdown("---")
         use_outlier_filter = st.checkbox("Highlight Outliers")
         outlier_low = st.number_input("Lower Bound (Yellow)", value=-5.0)
@@ -150,60 +145,40 @@ if uploaded_files:
         st.markdown("### 📋 Quick Summary")
         m_col1, m_col2, m_col3, m_col4 = st.columns(4)
         avg_val, std_val = combined_df['MEAS_VALUE'].mean(), combined_df['MEAS_VALUE'].std()
-        
-        m_col1.metric("Global Avg", f"{avg_val:.3f}")
-        m_col2.metric("Global 3-Sigma", f"{(std_val * 3):.3f}")
-        m_col3.metric("Max-Min Range", f"{(combined_df['MEAS_VALUE'].max() - combined_df['MEAS_VALUE'].min()):.3f}")
+        m_col1.metric("Global Average", f"{avg_val:.3f} um")
+        m_col2.metric("Global 3-Sigma", f"{(std_val * 3):.3f} um")
+        m_col3.metric("Max-Min Range", f"{(combined_df['MEAS_VALUE'].max() - combined_df['MEAS_VALUE'].min()):.3f} um")
         m_col4.metric("Total Bumps", f"{len(combined_df):,}")
 
-        with st.expander("📄 Detailed Statistics by File"):
+        with st.expander("📄 View File-wise Detailed Statistics"):
             file_stats = combined_df.groupby('SOURCE_FILE')['MEAS_VALUE'].agg(['mean', 'std', 'min', 'max', 'count']).reset_index()
             file_stats['3-Sigma'] = file_stats['std'] * 3
-            file_stats.columns = ['File Name', 'Average', 'Std Dev', 'Min', 'Max', 'Count', '3-Sigma']
-            st.dataframe(file_stats[['File Name', 'Average', '3-Sigma', 'Min', 'Max', 'Count']].style.format(precision=3), use_container_width=True)
+            st.dataframe(file_stats.style.format(precision=3), use_container_width=True)
         
         st.markdown("---")
+        tabs = st.tabs(["📊 Single Layer", "📈 Comparison", "📉 Shift Trend", "🧊 3D View", "🎯 Pitch Analysis"])
 
-        tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Single Layer", "📈 Comparison", "📉 Shift Trend", "🧊 3D View", "🎯 Pitch Analysis"])
-
-        with tab1:
-            c1, c2 = st.columns(2)
-            with c1: selected_layer = st.selectbox("Select Layer", ["All Layers"] + [f"Layer {i}" for i in unique_layers])
-            display_df = combined_df if selected_layer == "All Layers" else combined_df[combined_df['L_NUM'] == int(selected_layer.split(" ")[1])]
+        with tabs[0]:
+            sel_layer = st.selectbox("Select Layer", ["All Layers"] + [f"Layer {i}" for i in unique_layers])
+            disp_df = combined_df if sel_layer == "All Layers" else combined_df[combined_df['L_NUM'] == int(sel_layer.split(" ")[1])]
             
-            if d_type == "Shift":
-                with c2: active_target = st.selectbox("Target Data", [c for c in display_df.columns if c.endswith('_UM')], index=0)
-            else: active_target = 'MEAS_VALUE'
-
-            chart_type = st.radio("Chart Type", ["Heatmap", "Box Plot", "Histogram"], horizontal=True)
             fig1, ax1 = plt.subplots(figsize=(p_w, p_h))
-            
-            if chart_type == "Heatmap":
-                sc = ax1.scatter(display_df['X_VAL'], display_df['Y_VAL'], c=display_df[active_target], cmap='jet', s=15)
-                if use_custom_scale: sc.set_clim(v_min, v_max)
-                plt.colorbar(sc)
-            elif chart_type == "Box Plot":
-                sns.boxplot(data=display_df, x='SOURCE_FILE', y=active_target, hue='SOURCE_FILE', ax=ax1, palette='Set2')
-                if use_custom_scale: ax1.set_ylim(v_min, v_max)
-                apply_global_legend(ax1, global_legend_loc, show_legend)
-            elif chart_type == "Histogram":
-                sns.histplot(data=display_df, x=active_target, hue='SOURCE_FILE', kde=True, ax=ax1)
-                if use_custom_scale: ax1.set_xlim(v_min, v_max)
-                apply_global_legend(ax1, global_legend_loc, show_legend)
-            
+            sns.histplot(data=disp_df, x='MEAS_VALUE', hue='SOURCE_FILE', kde=True, ax=ax1)
+            if use_custom_scale: ax1.set_xlim(v_min, v_max)
+            apply_global_legend(ax1, global_legend_loc, show_legend)
             ax1.set_title(custom_title); ax1.set_xlabel(x_lbl); ax1.set_ylabel(y_lbl)
             st.pyplot(fig1)
 
-        with tab2:
+        with tabs[1]:
             if len(unique_layers) > 1:
                 fig2, ax2 = plt.subplots(figsize=(p_w, p_h))
                 sns.boxplot(data=combined_df, x='L_NUM', y='MEAS_VALUE', hue='SOURCE_FILE', ax=ax2)
                 if use_custom_scale: ax2.set_ylim(v_min, v_max)
                 apply_global_legend(ax2, global_legend_loc, show_legend)
-                ax2.set_title(custom_title); st.pyplot(fig2)
-            else: st.info("Need more layers.")
+                ax2.set_title("Layer Comparison"); st.pyplot(fig2)
+            else: st.info("Analysis requires more than one layer.")
 
-        with tab3:
+        with tabs[2]:
             shift_df = combined_df.dropna(subset=['P_ID'])
             if not shift_df.empty and len(unique_layers) > 1:
                 trend_list = []
@@ -215,7 +190,9 @@ if uploaded_files:
                             target = src_df[src_df['L_NUM'] == lyr][['P_ID', 'X_VAL', 'Y_VAL']]
                             merged = pd.merge(base, target, on='P_ID', suffixes=('_REF', '_TGT'))
                             if not merged.empty:
-                                trend_list.append({'Source': src, 'Layer': lyr, 'Avg_DX': (merged['X_VAL_TGT'] - merged['X_VAL_REF']).mean(), 'Avg_DY': (merged['Y_VAL_TGT'] - merged['Y_VAL_REF']).mean()})
+                                trend_list.append({'Source': src, 'Layer': lyr, 
+                                                   'Avg_DX': (merged['X_VAL_TGT'] - merged['X_VAL_REF']).mean(), 
+                                                   'Avg_DY': (merged['Y_VAL_TGT'] - merged['Y_VAL_REF']).mean()})
                 if trend_list:
                     trend_df = pd.DataFrame(trend_list)
                     fig3, ax3 = plt.subplots(figsize=(p_w, p_h))
@@ -224,60 +201,44 @@ if uploaded_files:
                         ax3.plot(data['Avg_DX'], data['Layer'], marker='o', label=f"{src} (X)")
                         ax3.plot(data['Avg_DY'], data['Layer'], marker='s', ls='--', label=f"{src} (Y)")
                     if use_custom_scale: ax3.set_xlim(v_min, v_max)
-                    ax3.set_title(custom_title); apply_global_legend(ax3, global_legend_loc, show_legend)
+                    ax3.set_title("Shift Trend"); apply_global_legend(ax3, global_legend_loc, show_legend)
                     st.pyplot(fig3)
 
-        with tab4:
+        with tabs[3]:
             st.subheader("Interactive 3D Layer Stack View")
             plot_3d_df = combined_df.copy()
             if use_outlier_filter:
                 conditions = [(plot_3d_df['MEAS_VALUE'] < outlier_low), (plot_3d_df['MEAS_VALUE'] > outlier_high)]
                 choices = ['Under Limit (Low)', 'Over Limit (High)']
                 plot_3d_df['Status'] = np.select(conditions, choices, default='Normal')
-                fig_3d = px.scatter_3d(
-                    plot_3d_df, x='X_VAL', y='Y_VAL', z='L_NUM',
-                    color='Status',
-                    color_discrete_map={'Under Limit (Low)': 'yellow', 'Over Limit (High)': 'red', 'Normal': 'blue'},
-                    opacity=0.6, labels={'X_VAL': 'X', 'Y_VAL': 'Y', 'L_NUM': 'Layer'},
-                    title=f"3D Outlier Highlight: {custom_title}"
-                )
+                fig_3d = px.scatter_3d(plot_3d_df, x='X_VAL', y='Y_VAL', z='L_NUM', color='Status',
+                                     color_discrete_map={'Under Limit (Low)': 'yellow', 'Over Limit (High)': 'red', 'Normal': 'blue'},
+                                     opacity=0.6, title=custom_title)
             else:
-                fig_3d = px.scatter_3d(
-                    plot_3d_df, x='X_VAL', y='Y_VAL', z='L_NUM',
-                    color='MEAS_VALUE', size_max=5, opacity=0.7,
-                    color_continuous_scale=color_option.lower(),
-                    labels={'X_VAL': 'X', 'Y_VAL': 'Y', 'L_NUM': 'Layer'},
-                    title=f"3D Distribution: {custom_title}"
-                )
-            fig_3d.update_layout(margin=dict(l=0, r=0, b=0, t=40), height=700)
-            st.plotly_chart(fig_3d, use_container_width=True)
+                fig_3d = px.scatter_3d(plot_3d_df, x='X_VAL', y='Y_VAL', z='L_NUM', color='MEAS_VALUE', color_continuous_scale=color_option.lower())
+            fig_3d.update_layout(height=700); st.plotly_chart(fig_3d, use_container_width=True)
 
-        with tab5:
+        with tabs[4]:
             st.subheader("🎯 Pitch Analysis (X & Y Distribution)")
             col_p1, col_p2 = st.columns(2)
             with col_p1:
                 st.markdown("**X-Pitch Analysis**")
                 fig_px, ax_px = plt.subplots(figsize=(p_w/2, p_h))
                 sns.boxplot(data=combined_df, x='SOURCE_FILE', y='X_PITCH', hue='SOURCE_FILE', ax=ax_px, palette='Blues')
-                ax_px.set_title("X-Pitch Boxplot"); apply_global_legend(ax_px, global_legend_loc, show_legend)
-                st.pyplot(fig_px)
+                apply_global_legend(ax_px, global_legend_loc, show_legend); st.pyplot(fig_px)
                 
                 fig_hx, ax_hx = plt.subplots(figsize=(p_w/2, p_h))
                 sns.histplot(data=combined_df, x='X_PITCH', hue='SOURCE_FILE', kde=True, ax=ax_hx)
-                ax_hx.set_title("X-Pitch Histogram"); apply_global_legend(ax_hx, global_legend_loc, show_legend)
-                st.pyplot(fig_hx)
+                apply_global_legend(ax_hx, global_legend_loc, show_legend); st.pyplot(fig_hx)
 
             with col_p2:
                 st.markdown("**Y-Pitch Analysis**")
                 fig_py, ax_py = plt.subplots(figsize=(p_w/2, p_h))
                 sns.boxplot(data=combined_df, x='SOURCE_FILE', y='Y_PITCH', hue='SOURCE_FILE', ax=ax_py, palette='Reds')
-                ax_py.set_title("Y-Pitch Boxplot"); apply_global_legend(ax_py, global_legend_loc, show_legend)
-                st.pyplot(fig_py)
+                apply_global_legend(ax_py, global_legend_loc, show_legend); st.pyplot(fig_py)
 
                 fig_hy, ax_hy = plt.subplots(figsize=(p_w/2, p_h))
                 sns.histplot(data=combined_df, x='Y_PITCH', hue='SOURCE_FILE', kde=True, ax=ax_hy)
-                ax_hy.set_title("Y-Pitch Histogram"); apply_global_legend(ax_hy, global_legend_loc, show_legend)
-                st.pyplot(fig_hy)
-
+                apply_global_legend(ax_hy, global_legend_loc, show_legend); st.pyplot(fig_hy)
 else:
-    st.info("Upload CSV files to start.")
+    st.info("Upload CSV files to begin analysis.")
