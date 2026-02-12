@@ -7,10 +7,12 @@ import plotly.express as px  # 3D 시각화용
 import io
 import os
 
-# --- [1] 데이터 전처리 로직 ---
+# --- [1] 데이터 전처리 및 Pitch 계산 로직 ---
 def process_data(df, scale_factor, apply_iqr):
+    # 컬럼명 대문자 표준화
     df.columns = [c.strip().upper() for c in df.columns]
     
+    # 1. 데이터 타입 판별 및 타겟 설정
     d_type = None
     target_cols = []
     
@@ -27,6 +29,7 @@ def process_data(df, scale_factor, apply_iqr):
         d_type, target_cols = "Coordinate", ['X_COORD']
     else: return None, None
 
+    # 2. 좌표 및 측정값 설정
     df['X_VAL'] = (df['X_COORD'] if 'X_COORD' in df.columns else df.get('BUMP_CENTER_X', 0)) * scale_factor
     df['Y_VAL'] = (df['Y_COORD'] if 'Y_COORD' in df.columns else df.get('BUMP_CENTER_Y', 0)) * scale_factor
     
@@ -35,6 +38,25 @@ def process_data(df, scale_factor, apply_iqr):
     
     df['MEAS_VALUE'] = df[target_cols[0] + '_UM']
     
+    # [Pitch 계산 알고리즘 - 행/열 바뀜 방지]
+    # X-Pitch: Y좌표가 같은 그룹(행) 내에서 X좌표 차이 계산
+    df['Y_GRID'] = df['Y_VAL'].round(1) 
+    df = df.sort_values(['SOURCE_FILE' if 'SOURCE_FILE' in df.columns else 'Y_GRID', 'Y_GRID', 'X_VAL'])
+    df['X_PITCH'] = df.groupby(['SOURCE_FILE' if 'SOURCE_FILE' in df.columns else 'Y_GRID', 'Y_GRID'])['X_VAL'].diff()
+
+    # Y-Pitch: X좌표가 같은 그룹(열) 내에서 Y좌표 차이 계산
+    df['X_GRID'] = df['X_VAL'].round(1)
+    df = df.sort_values(['SOURCE_FILE' if 'SOURCE_FILE' in df.columns else 'X_GRID', 'X_GRID', 'Y_VAL'])
+    df['Y_PITCH'] = df.groupby(['SOURCE_FILE' if 'SOURCE_FILE' in df.columns else 'X_GRID', 'X_GRID'])['Y_VAL'].diff()
+
+    # Pitch 이상치 제거 (인접하지 않은 Bump 간 계산 방지)
+    for p_col in ['X_PITCH', 'Y_PITCH']:
+        if not df[p_col].dropna().empty:
+            pq1, pq3 = df[p_col].quantile([0.25, 0.75])
+            piqr = pq3 - pq1
+            df.loc[(df[p_col] > pq3 + 1.5 * piqr), p_col] = np.nan
+
+    # 3. 레이어 번호 설정
     if 'LAYER_NUMBER' in df.columns:
         df['L_NUM'] = df['LAYER_NUMBER'].astype(int)
     elif 'BUMP_CENTER_Z' in df.columns:
@@ -53,6 +75,7 @@ def process_data(df, scale_factor, apply_iqr):
 
     df['P_ID'] = df['PILLAR_NUMBER'] if 'PILLAR_NUMBER' in df.columns else (df['GROUP_ID'] if 'GROUP_ID' in df.columns else None)
 
+    # 5. IQR 필터링
     df_clean = df.copy()
     if apply_iqr and d_type != "Coordinate":
         df_clean = df_clean[df_clean['MEAS_VALUE'] != 0]
@@ -80,19 +103,15 @@ def apply_global_legend(ax, loc, show_legend):
 st.set_page_config(page_title="NLX Multi-Layer Professional", layout="wide")
 st.title("🔬 NLX Bump Analysis Dashboard")
 
-# --- 사이드바 최적화 ---
 with st.sidebar:
     st.header("📁 Data Config")
     uploaded_files = st.file_uploader("Upload CSV Files", type=['csv'], accept_multiple_files=True)
-    
-    # [수정] +/- 버튼 없이 단순 숫자 입력 형식으로 변경 (label 축소 및 step 제거)
-    scale = st.number_input("Multiplier (Scale Factor)", value=1.0, step=None, format="%.4f")
+    scale = st.number_input("Multiplier (Scale Factor)", value=1.0, format="%.4f")
     use_iqr = st.checkbox("Apply IQR Filter", value=True)
 
     with st.expander("🎨 Plot Settings", expanded=True):
         p_w = st.slider("Plot Width", 5, 25, 12)
         p_h = st.slider("Plot Height", 3, 15, 6)
-        
         custom_title = st.text_input("Graph Title", "Alignment Analysis")
         x_lbl = st.text_input("X Axis Label", "X Position (um)")
         y_lbl = st.text_input("Y Axis Label", "Y Position (um)")
@@ -105,15 +124,15 @@ with st.sidebar:
         
         st.markdown("---")
         use_custom_scale = st.checkbox("Manual Axis Range", value=False)
-        v_min = st.number_input("Min Limit", value=-10.0, step=None)
-        v_max = st.number_input("Max Limit", value=10.0, step=None)
+        v_min = st.number_input("Min Limit", value=-10.0)
+        v_max = st.number_input("Max Limit", value=10.0)
 
     with st.expander("🧊 3D & Outlier Settings", expanded=False):
         color_option = st.selectbox("Color Theme", ["Viridis", "Plasma", "Inferno", "Magma", "Jet", "Turbo"])
         st.markdown("---")
         use_outlier_filter = st.checkbox("Highlight Outliers")
-        outlier_low = st.number_input("Lower Bound (Yellow)", value=-5.0, step=None)
-        outlier_high = st.number_input("Upper Bound (Red)", value=5.0, step=None)
+        outlier_low = st.number_input("Lower Bound (Yellow)", value=-5.0)
+        outlier_high = st.number_input("Upper Bound (Red)", value=5.0)
 
 if uploaded_files:
     all_data = []
@@ -128,7 +147,6 @@ if uploaded_files:
         combined_df = pd.concat(all_data)
         unique_layers = sorted(combined_df['L_NUM'].unique())
 
-        # --- Summary Dashboard ---
         st.markdown("### 📋 Quick Summary")
         m_col1, m_col2, m_col3, m_col4 = st.columns(4)
         avg_val, std_val = combined_df['MEAS_VALUE'].mean(), combined_df['MEAS_VALUE'].std()
@@ -146,7 +164,7 @@ if uploaded_files:
         
         st.markdown("---")
 
-        tab1, tab2, tab3, tab4 = st.tabs(["📊 Single Layer", "📈 Comparison", "📉 Shift Trend", "🧊 3D View"])
+        tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Single Layer", "📈 Comparison", "📉 Shift Trend", "🧊 3D View", "🎯 Pitch Analysis"])
 
         with tab1:
             c1, c2 = st.columns(2)
@@ -216,7 +234,6 @@ if uploaded_files:
                 conditions = [(plot_3d_df['MEAS_VALUE'] < outlier_low), (plot_3d_df['MEAS_VALUE'] > outlier_high)]
                 choices = ['Under Limit (Low)', 'Over Limit (High)']
                 plot_3d_df['Status'] = np.select(conditions, choices, default='Normal')
-                
                 fig_3d = px.scatter_3d(
                     plot_3d_df, x='X_VAL', y='Y_VAL', z='L_NUM',
                     color='Status',
@@ -234,6 +251,33 @@ if uploaded_files:
                 )
             fig_3d.update_layout(margin=dict(l=0, r=0, b=0, t=40), height=700)
             st.plotly_chart(fig_3d, use_container_width=True)
+
+        with tab5:
+            st.subheader("🎯 Pitch Analysis (X & Y Distribution)")
+            col_p1, col_p2 = st.columns(2)
+            with col_p1:
+                st.markdown("**X-Pitch Analysis**")
+                fig_px, ax_px = plt.subplots(figsize=(p_w/2, p_h))
+                sns.boxplot(data=combined_df, x='SOURCE_FILE', y='X_PITCH', hue='SOURCE_FILE', ax=ax_px, palette='Blues')
+                ax_px.set_title("X-Pitch Boxplot"); apply_global_legend(ax_px, global_legend_loc, show_legend)
+                st.pyplot(fig_px)
+                
+                fig_hx, ax_hx = plt.subplots(figsize=(p_w/2, p_h))
+                sns.histplot(data=combined_df, x='X_PITCH', hue='SOURCE_FILE', kde=True, ax=ax_hx)
+                ax_hx.set_title("X-Pitch Histogram"); apply_global_legend(ax_hx, global_legend_loc, show_legend)
+                st.pyplot(fig_hx)
+
+            with col_p2:
+                st.markdown("**Y-Pitch Analysis**")
+                fig_py, ax_py = plt.subplots(figsize=(p_w/2, p_h))
+                sns.boxplot(data=combined_df, x='SOURCE_FILE', y='Y_PITCH', hue='SOURCE_FILE', ax=ax_py, palette='Reds')
+                ax_py.set_title("Y-Pitch Boxplot"); apply_global_legend(ax_py, global_legend_loc, show_legend)
+                st.pyplot(fig_py)
+
+                fig_hy, ax_hy = plt.subplots(figsize=(p_w/2, p_h))
+                sns.histplot(data=combined_df, x='Y_PITCH', hue='SOURCE_FILE', kde=True, ax=ax_hy)
+                ax_hy.set_title("Y-Pitch Histogram"); apply_global_legend(ax_hy, global_legend_loc, show_legend)
+                st.pyplot(fig_hy)
 
 else:
     st.info("Upload CSV files to start.")
