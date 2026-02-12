@@ -23,7 +23,7 @@ def process_data(df, scale_factor, apply_iqr):
     elif 'X_COORD' in df.columns: d_type, target_cols = "Coordinate", ['X_COORD']
     else: return None, None
 
-    # 2. 좌표 설정 (Multiplier 적용)
+    # 2. 좌표 설정 (Multiplier를 즉시 적용하여 모든 계산을 um 단위로 통일)
     df['X_VAL'] = (df['X_COORD'] if 'X_COORD' in df.columns else df.get('BUMP_CENTER_X', 0)) * scale_factor
     df['Y_VAL'] = (df['Y_COORD'] if 'Y_COORD' in df.columns else df.get('BUMP_CENTER_Y', 0)) * scale_factor
     
@@ -45,22 +45,30 @@ def process_data(df, scale_factor, apply_iqr):
         else: df['L_NUM'] = 0
     else: df['L_NUM'] = 0
 
-    # 4. [Pitch 알고리즘] 그리드 기반 + ID 연속성 체크
+    # 4. [개선] 양산형 Pitch 계산 (데이터 스케일 대응형)
     df['P_ID'] = df['GROUP_ID'] if 'GROUP_ID' in df.columns else df.index
     group_base = ['SOURCE_FILE', 'L_NUM'] if 'SOURCE_FILE' in df.columns else ['L_NUM']
 
-    # X_Pitch: 동일 행(Y_GRID) 내 계산
-    df['Y_GRID'] = df['Y_VAL'].round(3) 
+    # 데이터의 최소 간격을 파악하여 그리드 크기를 유동적으로 결정 (um 단위 기준 보통 1.0~10.0 사이)
+    # scale_factor가 1000이면 round(0), 1이면 round(3)이 적절함. 이를 자동화하기 위해 0.5um 단위 그리드 사용
+    grid_size = 0.5 
+    
+    # X_Pitch 계산 (Y 그리드 기준 정렬)
+    df['Y_GRID'] = (df['Y_VAL'] / grid_size).round() * grid_size
     df = df.sort_values(by=group_base + ['Y_GRID', 'X_VAL'])
+    
+    # GroupID가 연속적인 경우만 계산 (행 바뀜 방지)
     df['ID_DIFF'] = df.groupby(group_base + ['Y_GRID'])['P_ID'].diff()
-    # ID가 연속적이고 거리가 50um 이내인 경우만 인정
-    df['X_PITCH'] = np.where((df['ID_DIFF'] == 1), df.groupby(group_base + ['Y_GRID'])['X_VAL'].diff().abs(), np.nan)
+    df['X_PITCH'] = np.where(df['ID_DIFF'] == 1, df.groupby(group_base + ['Y_GRID'])['X_VAL'].diff().abs(), np.nan)
 
-    # Y_Pitch: 동일 열(X_GRID) 내 계산
-    df['X_GRID'] = df['X_VAL'].round(3)
+    # Y_Pitch 계산 (X 그리드 기준 정렬)
+    df['X_GRID'] = (df['X_VAL'] / grid_size).round() * grid_size
     df = df.sort_values(by=group_base + ['X_GRID', 'Y_VAL'])
-    df['Y_PITCH_RAW'] = df.groupby(group_base + ['X_GRID'])['Y_VAL'].diff().abs()
-    df['Y_PITCH'] = np.where(df['Y_PITCH_RAW'] < 50, df['Y_PITCH_RAW'], np.nan)
+    
+    # Y축 방향은 ID가 건너뛸 수 있으므로 좌표 차이가 일정 거리(예: 예상 Pitch의 1.5배) 이내인 경우만 계산
+    df['Y_P_RAW'] = df.groupby(group_base + ['X_GRID'])['Y_VAL'].diff().abs()
+    # 일반적인 반도체 범프 피치(약 50um)를 고려하여 100um 이상은 무시
+    df['Y_PITCH'] = np.where(df['Y_P_RAW'] < 100, df['Y_P_RAW'], np.nan)
 
     # Pitch 이상치 제거 (IQR)
     for col in ['X_PITCH', 'Y_PITCH']:
@@ -79,19 +87,17 @@ def process_data(df, scale_factor, apply_iqr):
 
     return df_clean, d_type
 
-# --- 범례 관리 함수 (에러 방지 강화) ---
+# --- 범례 관리 함수 ---
 def apply_global_legend(ax, loc, show_legend):
     if not show_legend:
         leg = ax.get_legend()
         if leg: leg.remove()
         return
     try:
-        # Seaborn move_legend 사용 시도 (타이틀 제거 포함)
         sns.move_legend(ax, loc=loc, title=None)
     except:
         handles, labels = ax.get_legend_handles_labels()
-        if handles and labels:
-            ax.legend(handles=handles, labels=labels, loc=loc, title=None)
+        if handles: ax.legend(handles=handles, labels=labels, loc=loc, title=None)
 
 # --- [2] UI 구성 ---
 st.set_page_config(page_title="NLX Multi-Layer Professional", layout="wide")
@@ -127,6 +133,7 @@ if uploaded_files:
     all_data = []
     for file in uploaded_files:
         raw_df = pd.read_csv(file)
+        # Multiplier 적용 로직이 포함된 process_data 호출
         p_df, d_type = process_data(raw_df, scale, use_iqr)
         if p_df is not None:
             p_df['SOURCE_FILE'] = os.path.splitext(file.name)[0]
@@ -136,12 +143,12 @@ if uploaded_files:
         combined_df = pd.concat(all_data)
         unique_layers = sorted(combined_df['L_NUM'].unique())
 
-        # Quick Summary & Detailed Stats 유지...
+        # Quick Summary
         st.markdown("### 📋 Quick Summary")
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Global Average", f"{combined_df['MEAS_VALUE'].mean():.3f} um")
-        m2.metric("Global 3-Sigma", f"{(combined_df['MEAS_VALUE'].std()*3):.3f} um")
-        m3.metric("Max-Min Range", f"{(combined_df['MEAS_VALUE'].max()-combined_df['MEAS_VALUE'].min()):.3f} um")
+        m1.metric("Global Average", f"{combined_df['MEAS_VALUE'].mean():.3f}")
+        m2.metric("Global 3-Sigma", f"{(combined_df['MEAS_VALUE'].std()*3):.3f}")
+        m3.metric("Max-Min Range", f"{(combined_df['MEAS_VALUE'].max()-combined_df['MEAS_VALUE'].min()):.3f}")
         m4.metric("Total Bumps", f"{len(combined_df):,}")
 
         tabs = st.tabs(["📊 Single Layer", "📈 Comparison", "📉 Shift Trend", "🧊 3D View", "🎯 Pitch Analysis"])
@@ -156,25 +163,21 @@ if uploaded_files:
             ax1.set_title(custom_title); ax1.set_xlabel(x_lbl); ax1.set_ylabel(y_lbl)
             st.pyplot(fig1)
 
-        with tabs[3]: # 3D View 고도화
+        with tabs[3]:
             st.subheader("Interactive 3D Layer Stack View")
             plot_3d_df = combined_df.copy()
             if use_outlier_filter:
                 conditions = [(plot_3d_df['MEAS_VALUE'] < outlier_low), (plot_3d_df['MEAS_VALUE'] > outlier_high)]
                 choices = ['Under Limit (Low)', 'Over Limit (High)']
                 plot_3d_df['Status'] = np.select(conditions, choices, default='Normal')
-                
-                # 컬러 매핑 안정화
-                fig_3d = px.scatter_3d(plot_3d_df, x='X_VAL', y='Y_VAL', z='L_NUM', 
-                                     color='Status',
+                fig_3d = px.scatter_3d(plot_3d_df, x='X_VAL', y='Y_VAL', z='L_NUM', color='Status',
                                      color_discrete_map={'Under Limit (Low)': 'yellow', 'Over Limit (High)': 'red', 'Normal': 'blue'},
-                                     opacity=0.6, title=custom_title)
+                                     opacity=0.6)
             else:
-                fig_3d = px.scatter_3d(plot_3d_df, x='X_VAL', y='Y_VAL', z='L_NUM', 
-                                     color='MEAS_VALUE', color_continuous_scale=color_option.lower())
+                fig_3d = px.scatter_3d(plot_3d_df, x='X_VAL', y='Y_VAL', z='L_NUM', color='MEAS_VALUE', color_continuous_scale=color_option.lower())
             fig_3d.update_layout(height=700); st.plotly_chart(fig_3d, use_container_width=True)
 
-        with tabs[4]: # Pitch Analysis 유지
+        with tabs[4]:
             st.subheader("🎯 Pitch Analysis (X & Y Distribution)")
             col_p1, col_p2 = st.columns(2)
             for col, p_type, p_color in zip([col_p1, col_p2], ['X_PITCH', 'Y_PITCH'], ['Blues', 'Reds']):
@@ -187,7 +190,5 @@ if uploaded_files:
                     fig_h, ax_h = plt.subplots(figsize=(p_w/2, p_h))
                     sns.histplot(data=combined_df, x=p_type, hue='SOURCE_FILE', kde=True, ax=ax_h)
                     apply_global_legend(ax_h, global_legend_loc, show_legend); st.pyplot(fig_h)
-
-        # Tab 1, 2 기존 로직 유지...
 else:
     st.info("Please upload CSV files to begin analysis.")
