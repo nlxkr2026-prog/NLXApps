@@ -9,10 +9,8 @@ import os
 
 # --- [1] 데이터 전처리 로직 ---
 def process_data(df, scale_factor, apply_iqr):
-    # 컬럼명 대문자 표준화
     df.columns = [c.strip().upper() for c in df.columns]
     
-    # 1. 데이터 타입 판별 및 타겟 설정
     d_type = None
     target_cols = []
     
@@ -29,17 +27,14 @@ def process_data(df, scale_factor, apply_iqr):
         d_type, target_cols = "Coordinate", ['X_COORD']
     else: return None, None
 
-    # 2. 좌표 및 측정값 설정 (입력받은 scale_factor 곱함)
     df['X_VAL'] = (df['X_COORD'] if 'X_COORD' in df.columns else df.get('BUMP_CENTER_X', 0)) * scale_factor
     df['Y_VAL'] = (df['Y_COORD'] if 'Y_COORD' in df.columns else df.get('BUMP_CENTER_Y', 0)) * scale_factor
     
     for col in target_cols:
         df[col + '_UM'] = df[col] * scale_factor
     
-    # 기본 메인 값 설정
     df['MEAS_VALUE'] = df[target_cols[0] + '_UM']
     
-    # 3. 레이어 번호 설정
     if 'LAYER_NUMBER' in df.columns:
         df['L_NUM'] = df['LAYER_NUMBER'].astype(int)
     elif 'BUMP_CENTER_Z' in df.columns:
@@ -58,7 +53,6 @@ def process_data(df, scale_factor, apply_iqr):
 
     df['P_ID'] = df['PILLAR_NUMBER'] if 'PILLAR_NUMBER' in df.columns else (df['GROUP_ID'] if 'GROUP_ID' in df.columns else None)
 
-    # 5. IQR 필터링
     df_clean = df.copy()
     if apply_iqr and d_type != "Coordinate":
         df_clean = df_clean[df_clean['MEAS_VALUE'] != 0]
@@ -91,12 +85,11 @@ with st.sidebar:
     st.header("📁 Data Config")
     uploaded_files = st.file_uploader("Upload CSV Files", type=['csv'], accept_multiple_files=True)
     
-    # [수정] 데이터 배수 곱하기 옵션 (Global Scale Factor) 강화
-    scale = st.number_input("Data Multiplier (e.g. 1000 for mm to um)", value=1.0, step=0.1, help="모든 좌표 및 측정값에 이 값을 곱합니다.")
+    # [수정] +/- 버튼 없이 단순 숫자 입력 형식으로 변경 (label 축소 및 step 제거)
+    scale = st.number_input("Multiplier (Scale Factor)", value=1.0, step=None, format="%.4f")
     use_iqr = st.checkbox("Apply IQR Filter", value=True)
 
     with st.expander("🎨 Plot Settings", expanded=True):
-        # [수정] Plot Scale 삭제 및 개별 가로/세로 조절 복구
         p_w = st.slider("Plot Width", 5, 25, 12)
         p_h = st.slider("Plot Height", 3, 15, 6)
         
@@ -112,15 +105,15 @@ with st.sidebar:
         
         st.markdown("---")
         use_custom_scale = st.checkbox("Manual Axis Range", value=False)
-        v_min = st.number_input("Min Limit", value=-10.0)
-        v_max = st.number_input("Max Limit", value=10.0)
+        v_min = st.number_input("Min Limit", value=-10.0, step=None)
+        v_max = st.number_input("Max Limit", value=10.0, step=None)
 
     with st.expander("🧊 3D & Outlier Settings", expanded=False):
         color_option = st.selectbox("Color Theme", ["Viridis", "Plasma", "Inferno", "Magma", "Jet", "Turbo"])
         st.markdown("---")
         use_outlier_filter = st.checkbox("Highlight Outliers")
-        outlier_low = st.number_input("Lower Bound (Yellow)", value=-5.0)
-        outlier_high = st.number_input("Upper Bound (Red)", value=5.0)
+        outlier_low = st.number_input("Lower Bound (Yellow)", value=-5.0, step=None)
+        outlier_high = st.number_input("Upper Bound (Red)", value=5.0, step=None)
 
 if uploaded_files:
     all_data = []
