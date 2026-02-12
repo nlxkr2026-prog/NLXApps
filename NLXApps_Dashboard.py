@@ -7,7 +7,7 @@ import plotly.figure_factory as ff
 
 # --- 1. 페이지 설정 ---
 st.set_page_config(page_title="Bump Master Analyzer Pro", layout="wide")
-st.title("🔬 Universal Bump Quality Analyzer (Order Independent)")
+st.title("🔬 Universal Bump Quality Analyzer (Metric-Linked Heatmap)")
 
 # --- 2. 사이드바 설정 ---
 st.sidebar.header("⚙️ 분석 및 시각화 설정")
@@ -38,8 +38,7 @@ if uploaded_files:
         return series.mask((series < Q1 - 1.5 * IQR) | (series > Q3 + 1.5 * IQR))
 
     def preprocess_df(df, scale):
-        """업로드된 모든 데이터를 um 단위로 표준화"""
-        cols_to_scale = ['Bump_Center_X', 'Bump_Center_Y', 'Bump_Center_Z', 'Radius', 'Height', 'Shift_X', 'Shift_Y', 'Shift_Norm', 'X_Coord', 'Y_Coord', 'Z_Coord', 'Top_Z', 'Bottom_Z', 'Middle_Z']
+        cols_to_scale = ['Bump_Center_X', 'Bump_Center_Y', 'Bump_Center_Z', 'Radius', 'Height', 'Shift_X', 'Shift_Y', 'Shift_Norm', 'X_Coord', 'Y_Coord', 'Z_Coord']
         for c in df.columns:
             if c in cols_to_scale:
                 df[c] = pd.to_numeric(df[c], errors='coerce')
@@ -49,7 +48,6 @@ if uploaded_files:
         return df
 
     def get_layer_info(df, gap):
-        """Z값을 기준으로 레이어 생성 (Master용)"""
         z_col = next((c for c in ['Bump_Center_Z', 'Z_Coord', 'Intersection_Height'] if c in df.columns), None)
         if z_col and df[z_col].notna().any():
             df = df.sort_values(z_col).reset_index(drop=True)
@@ -59,7 +57,6 @@ if uploaded_files:
         return df
 
     def calculate_xy_pitch(df):
-        """Height 컬럼이 감지될 때만 Pitch 계산"""
         if 'Height' not in df.columns: return df
         x_c = next((c for c in ['Bump_Center_X', 'X_Coord'] if c in df.columns), None)
         y_c = next((c for c in ['Bump_Center_Y', 'Y_Coord'] if c in df.columns), None)
@@ -79,16 +76,12 @@ if uploaded_files:
             res.append(ldf)
         return pd.concat(res) if res else df
 
-    # --- 4. 메인 데이터 처리 엔진 (업로드 순서 무시 로직) ---
-
-    # 1단계: 모든 파일 수집
+    # --- 4. 데이터 로드 및 마스터 매핑 ---
     raw_data_dict = {f.name: preprocess_df(pd.read_csv(f), scale_factor) for f in uploaded_files}
-    
-    st.info("🎯 **Master File**을 선택하세요. 어떤 파일을 먼저 올렸든 이 선택이 기준이 됩니다.")
+    st.info("🎯 **Master File**을 선택하세요. 모든 데이터가 이 파일의 레이어 기준에 맞춰집니다.")
     m_options = ["Independent Analysis"] + list(raw_data_dict.keys())
     m_key = st.selectbox("레이어 기준(Master) 파일 선택", m_options)
     
-    # 2단계: 기준 정보 추출
     layer_map, master_coords = None, None
     if m_key != "Independent Analysis":
         m_df_base = get_layer_info(raw_data_dict[m_key], z_gap_threshold)
@@ -98,10 +91,8 @@ if uploaded_files:
         zc_m = next((c for c in ['Bump_Center_Z', 'Z_Coord'] if c in m_df_base.columns), 'Z')
         master_coords = m_df_base[['Group_ID', xc_m, yc_m, zc_m]].rename(columns={xc_m:'X', yc_m:'Y', zc_m:'Z'}).drop_duplicates()
 
-    # 3단계: 통합 처리
     final_processed_list = []
     for name, df in raw_data_dict.items():
-        # 레이어 매핑 (Master 기준)
         if m_key != "Independent Analysis" and name != m_key:
             if 'Group_ID' in df.columns:
                 df = df.merge(layer_map, on='Group_ID', how='inner')
@@ -109,7 +100,6 @@ if uploaded_files:
         else:
             df = get_layer_info(df, z_gap_threshold)
         
-        # Pitch 및 필터링
         df = calculate_xy_pitch(df)
         if use_filter_height and 'Height' in df.columns: df['Height'] = apply_iqr_filter(df['Height'])
         if use_filter_radius and 'Radius' in df.columns: df['Radius'] = apply_iqr_filter(df['Radius'])
@@ -123,7 +113,7 @@ if uploaded_files:
     if final_processed_list:
         total_df = pd.concat(final_processed_list, ignore_index=True)
 
-        # --- 대시보드 출력 ---
+        # --- 상단 통계 ---
         st.subheader("📊 Summary Statistics")
         m_list = [c for c in ['Radius', 'Height', 'Pitch_X', 'Pitch_Y', 'Shift_X', 'Shift_Y', 'Shift_Norm'] if c in total_df.columns]
         st.dataframe(total_df.groupby(['File_Name', 'Inferred_Layer'])[m_list].agg(['mean', 'std', 'count']).round(3), use_container_width=True)
@@ -131,40 +121,49 @@ if uploaded_files:
         t1, t2, t3 = st.tabs(["📏 Group A (Shape)", "🎯 Group B (Shift)", "🌐 3D View"])
 
         with t1:
-            sel_a = st.selectbox("지표 선택", [c for c in ['Radius', 'Height', 'Pitch_X', 'Pitch_Y'] if c in total_df.columns])
+            st.header("Group A: Shape Analysis")
+            sel_a = st.selectbox("지표 선택 (A)", [c for c in ['Radius', 'Height', 'Pitch_X', 'Pitch_Y'] if c in total_df.columns])
             pdf_a = total_df.dropna(subset=[sel_a])
+            
             c1, c2 = st.columns(2)
             c1.plotly_chart(px.box(pdf_a, x="File_Name", y=sel_a, color="Inferred_Layer" if "Split" in layer_view_mode else None, points=False), use_container_width=True)
             c2.plotly_chart(px.histogram(pdf_a, x=sel_a, color="File_Name" if "Split" not in layer_view_mode else "Inferred_Layer", barmode="overlay", facet_col="File_Name" if "Facet" in hist_layout else None), use_container_width=True)
             
             st.divider()
-            st.subheader("📍 Spatial Heatmap")
-            f_m = st.selectbox("지도 파일", total_df['File_Name'].unique(), key="ma")
-            m_a = total_df[(total_df['File_Name'] == f_m) & (total_df[sel_a].notna())]
-            xc_a = next((c for c in ['Bump_Center_X', 'X_Coord'] if c in m_a.columns), 'X')
-            yc_a = next((c for c in ['Bump_Center_Y', 'Y_Coord'] if c in m_a.columns), 'Y')
-            st.plotly_chart(px.scatter(m_a, x=xc_a, y=yc_a, color=sel_a, facet_col="Inferred_Layer", color_continuous_scale="Turbo"), use_container_width=True)
+            # [수정] Metric 동기화 Heatmap
+            st.subheader(f"📍 Spatial Map: {sel_a} Distribution")
+            f_m_a = st.selectbox("지도 출력 파일 선택", pdf_a['File_Name'].unique(), key="ma_f")
+            m_a_df = pdf_a[pdf_a['File_Name'] == f_m_a]
+            
+            if not m_a_df.empty:
+                xc_h = next((c for c in ['Bump_Center_X', 'X_Coord'] if c in m_a_df.columns), 'X')
+                yc_h = next((c for c in ['Bump_Center_Y', 'Y_Coord'] if c in m_a_df.columns), 'Y')
+                # 층별(Facet) Heatmap 출력
+                fig_heat = px.scatter(m_a_df, x=xc_h, y=yc_h, color=sel_a, 
+                                      facet_col="Inferred_Layer", color_continuous_scale="Turbo",
+                                      title=f"{f_m_a} - {sel_a} Spatial Distribution")
+                fig_heat.update_yaxes(scaleanchor="x", scaleratio=1)
+                st.plotly_chart(fig_heat, use_container_width=True)
 
         with t2:
+            st.header("Group B: Shift Analysis")
             b_mets = [c for c in ['Shift_X', 'Shift_Y', 'Shift_Norm'] if c in total_df.columns]
             if b_mets:
-                sel_b = st.selectbox("Shift 선택", b_mets)
+                sel_b = st.selectbox("Shift 지표 선택", b_mets)
                 pdf_b = total_df.dropna(subset=[sel_b])
                 c1, c2 = st.columns(2)
                 c1.plotly_chart(px.box(pdf_b, x="File_Name", y=sel_b, color="Inferred_Layer" if "Split" in layer_view_mode else None, points=False), use_container_width=True)
                 c2.plotly_chart(px.histogram(pdf_b, x=sel_b, color="File_Name" if "Split" not in layer_view_mode else "Inferred_Layer", barmode="overlay", facet_col="File_Name" if "Facet" in hist_layout else None), use_container_width=True)
                 
-                if 'Shift_X' in total_df.columns and 'Shift_Y' in total_df.columns:
-                    st.divider()
-                    st.subheader("📍 Shift Vector Map")
-                    v_f = st.selectbox("화살표 파일", total_df['File_Name'].unique())
-                    v_d = total_df[(total_df['File_Name'] == v_f) & total_df['Shift_X'].notna()]
-                    if not v_d.empty:
-                        xc, yc = ('Bump_Center_X', 'Bump_Center_Y') if 'Bump_Center_X' in v_d.columns else ('X_Coord', 'Y_Coord')
-                        fig_v = ff.create_quiver(x=v_d[xc], y=v_d[yc], u=v_d['Shift_X']*vector_scale, v=v_d['Shift_Y']*vector_scale, scale=1, arrow_scale=0.2, line=dict(color='red', width=1))
-                        fig_v.add_trace(go.Scatter(x=v_d[xc], y=v_d[yc], mode='markers', marker=dict(size=3, color='blue', opacity=0.3)))
-                        fig_v.update_layout(height=700, yaxis=dict(scaleanchor="x", scaleratio=1))
-                        st.plotly_chart(fig_v, use_container_width=True)
+                st.divider()
+                st.subheader(f"📍 Spatial Map: {sel_b} Distribution")
+                f_m_b = st.selectbox("지도 출력 파일 선택", pdf_b['File_Name'].unique(), key="mb_f")
+                m_b_df = pdf_b[pdf_b['File_Name'] == f_m_b]
+                if not m_b_df.empty:
+                    xc_s = next((c for c in ['Bump_Center_X', 'X_Coord'] if c in m_b_df.columns), 'X')
+                    yc_s = next((c for c in ['Bump_Center_Y', 'Y_Coord'] if c in m_b_df.columns), 'Y')
+                    st.plotly_chart(px.scatter(m_b_df, x=xc_s, y=yc_s, color=sel_met_b if 'sel_met_b' in locals() else sel_b, 
+                                               facet_col="Inferred_Layer", color_continuous_scale="Turbo"), use_container_width=True)
 
         with t3:
             st.header("🌐 3D Structural View")
@@ -183,11 +182,11 @@ if uploaded_files:
             if avail_3d:
                 c_3 = st.selectbox("3D 색상 지표", avail_3d)
                 df3 = df3.dropna(subset=[c_3])
-                apply_th = st.checkbox("⚠️ Threshold Highlight", value=False)
+                apply_th = st.checkbox("⚠️ Threshold Highlight (Red/Yellow)", value=False)
                 if apply_th:
                     cx, cy = st.columns(2)
-                    hth = cx.number_input("High (Red)", value=float(df3[c_3].max()))
-                    lth = cy.number_input("Low (Yellow)", value=float(df3[c_3].min()))
+                    hth = cx.number_input("High (Red Above)", value=float(df3[c_3].max()))
+                    lth = cy.number_input("Low (Yellow Below)", value=float(df3[c_3].min()))
                     df3['Color'] = df3[c_3].apply(lambda v: 'Red' if v >= hth else ('Yellow' if v <= lth else 'Normal'))
                     fig3 = px.scatter_3d(df3, x=x3, y=y3, z=z3, color='Color', color_discrete_map={'Red': 'red', 'Yellow': 'yellow', 'Normal': 'lightgray'})
                 else:
@@ -195,4 +194,4 @@ if uploaded_files:
                 fig3.update_layout(scene=dict(aspectmode='data'), height=800)
                 st.plotly_chart(fig3, use_container_width=True)
 else:
-    st.info("CSV 파일들을 업로드하세요. 업로드 순서는 상관없습니다.")
+    st.info("CSV 파일을 업로드하면 분석 엔진이 가동됩니다.")
