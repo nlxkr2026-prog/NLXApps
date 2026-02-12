@@ -9,10 +9,10 @@ import os
 
 # --- [1] 데이터 전처리 및 정밀 Pitch 계산 로직 ---
 def process_data(df, scale_factor, apply_iqr):
-    # 컬럼명 대문자 표준화
+    # 컬럼명 표준화 (공백 제거 및 대문자화)
     df.columns = [c.strip().upper() for c in df.columns]
     
-    # 1. 데이터 타입 판별 및 타겟 설정
+    # 1. 데이터 타입 판별
     d_type = None
     target_cols = []
     if 'HEIGHT' in df.columns: d_type, target_cols = "Height", ['HEIGHT']
@@ -24,14 +24,15 @@ def process_data(df, scale_factor, apply_iqr):
     elif 'X_COORD' in df.columns: d_type, target_cols = "Coordinate", ['X_COORD']
     else: return None, None
 
-    # 2. 좌표 및 측정값 설정 (Multiplier 적용)
+    # 2. 좌표 설정 (Multiplier 적용)
     df['X_VAL'] = (df['X_COORD'] if 'X_COORD' in df.columns else df.get('BUMP_CENTER_X', 0)) * scale_factor
     df['Y_VAL'] = (df['Y_COORD'] if 'Y_COORD' in df.columns else df.get('BUMP_CENTER_Y', 0)) * scale_factor
+    
     for col in target_cols:
         df[col + '_UM'] = df[col] * scale_factor
     df['MEAS_VALUE'] = df[target_cols[0] + '_UM']
 
-    # 3. 레이어 번호 설정 (Pitch 계산 전 필수 수행)
+    # 3. 레이어 번호 설정 (Pitch 계산 전 필수)
     if 'LAYER_NUMBER' in df.columns:
         df['L_NUM'] = df['LAYER_NUMBER'].astype(int)
     elif 'BUMP_CENTER_Z' in df.columns:
@@ -43,35 +44,30 @@ def process_data(df, scale_factor, apply_iqr):
             l_assign = np.zeros(len(df), dtype=int)
             for p in splits: l_assign[df['BUMP_CENTER_Z'] >= p] += 1
             df['L_NUM'] = l_assign
-        else:
-            df['L_NUM'] = 0
-    else:
-        df['L_NUM'] = 0
+        else: df['L_NUM'] = 0
+    else: df['L_NUM'] = 0
 
-    # 4. 개선된 Pitch 알고리즘 (Layer 및 Group_ID 연속성 반영)
-    # 식별자 설정
-    df['P_ID'] = df['GROUP_ID'] if 'GROUP_ID' in df.columns else (df['PILLAR_NUMBER'] if 'PILLAR_NUMBER' in df.columns else df.index)
+    # 4. [핵심] 개선된 Pitch 알고리즘 (GroupID 연속성 및 좌표 그룹화 반영)
     group_base = ['SOURCE_FILE', 'L_NUM'] if 'SOURCE_FILE' in df.columns else ['L_NUM']
+    df['P_ID'] = df['GROUP_ID'] if 'GROUP_ID' in df.columns else df.index
 
-    # [X-Pitch] 동일 레이어 내에서 Y좌표가 같은 그룹(행) 식별
-    df['Y_ROUND'] = (df['Y_VAL'] * 100).round() # 약 10um 오차 허용
+    # [X-Pitch] 동일 레이어 내에서 Y좌표가 거의 같은 범프들을 한 줄로 인식
+    # 소수점 셋째 자리까지 일치하면 동일 행으로 간주하여 정밀도 향상
+    df['Y_ROUND'] = df['Y_VAL'].round(3)
     df = df.sort_values(group_base + ['Y_ROUND', 'X_VAL'])
-    # ID가 연속적이고 동일 행일 때만 차이 계산
-    df['ID_DIFF'] = df.groupby(group_base + ['Y_ROUND'])['P_ID'].diff()
-    df['X_PITCH'] = np.where(df['ID_DIFF'] == 1, df.groupby(group_base + ['Y_ROUND'])['X_VAL'].diff().abs(), np.nan)
-
-    # [Y-Pitch] 동일 레이어 내에서 X좌표가 같은 그룹(열) 식별
-    df['X_ROUND'] = (df['X_VAL'] * 100).round()
-    df = df.sort_values(group_base + ['X_ROUND', 'Y_VAL'])
-    # ID가 비연속적인 구간(행 바뀜 등)은 계산 제외
-    df['Y_PITCH'] = df.groupby(group_base + ['X_ROUND'])['Y_VAL'].diff().abs()
     
-    # 물리적 한계를 벗어나는 Pitch 필터링 (Noise 제거)
-    max_p = 50.0 # 공정에 맞춰 조절 가능
-    df.loc[df['X_PITCH'] > max_p, 'X_PITCH'] = np.nan
-    df.loc[df['Y_PITCH'] > max_p, 'Y_PITCH'] = np.nan
+    # GroupID가 1씩 증가할 때만 인접 범프로 간주하여 X 차이 계산
+    df['ID_STEP'] = df.groupby(group_base + ['Y_ROUND'])['P_ID'].diff()
+    df['X_PITCH'] = np.where(df['ID_STEP'] == 1, df.groupby(group_base + ['Y_ROUND'])['X_VAL'].diff().abs(), np.nan)
 
-    # 5. IQR 필터링 (측정값 기준)
+    # [Y-Pitch] X좌표가 거의 같은 범프들을 한 열로 인식
+    df['X_ROUND'] = df['X_VAL'].round(3)
+    df = df.sort_values(group_base + ['X_ROUND', 'Y_VAL'])
+    # 열 방향은 ID가 건너뛰는 경우가 많으므로 좌표 차이 기반으로 인접성 판단 (예: 50um 이내)
+    df['Y_PITCH_RAW'] = df.groupby(group_base + ['X_ROUND'])['Y_VAL'].diff().abs()
+    df['Y_PITCH'] = np.where(df['Y_PITCH_RAW'] < 50, df['Y_PITCH_RAW'], np.nan) # 50um 이상은 행 바뀜으로 간주
+
+    # 5. IQR 필터링 (최종 결과값 정제)
     df_clean = df.copy()
     if apply_iqr and d_type != "Coordinate":
         df_clean = df_clean[df_clean['MEAS_VALUE'] != 0]
@@ -101,6 +97,7 @@ st.title("🔬 NLX Bump Analysis Dashboard")
 with st.sidebar:
     st.header("📁 Data Config")
     uploaded_files = st.file_uploader("Upload CSV Files", type=['csv'], accept_multiple_files=True)
+    # 버튼 없이 입력만 받는 형식
     scale = st.number_input("Multiplier (Scale Factor)", value=1.0, format="%.4f")
     use_iqr = st.checkbox("Apply IQR Filter", value=True)
 
@@ -116,7 +113,6 @@ with st.sidebar:
         global_legend_loc = st.selectbox("Legend Loc", 
             options=["best", "upper right", "upper left", "lower left", "lower right", "right", "center left", "center right", "lower center", "upper center", "center"], 
             index=1, disabled=not show_legend)
-        
         st.markdown("---")
         use_custom_scale = st.checkbox("Manual Axis Range", value=False)
         v_min = st.number_input("Min Limit", value=-10.0)
@@ -161,7 +157,6 @@ if uploaded_files:
         with tabs[0]:
             sel_layer = st.selectbox("Select Layer", ["All Layers"] + [f"Layer {i}" for i in unique_layers])
             disp_df = combined_df if sel_layer == "All Layers" else combined_df[combined_df['L_NUM'] == int(sel_layer.split(" ")[1])]
-            
             fig1, ax1 = plt.subplots(figsize=(p_w, p_h))
             sns.histplot(data=disp_df, x='MEAS_VALUE', hue='SOURCE_FILE', kde=True, ax=ax1)
             if use_custom_scale: ax1.set_xlim(v_min, v_max)
@@ -176,7 +171,7 @@ if uploaded_files:
                 if use_custom_scale: ax2.set_ylim(v_min, v_max)
                 apply_global_legend(ax2, global_legend_loc, show_legend)
                 ax2.set_title("Layer Comparison"); st.pyplot(fig2)
-            else: st.info("Analysis requires more than one layer.")
+            else: st.info("Requires more than one layer for comparison.")
 
         with tabs[2]:
             shift_df = combined_df.dropna(subset=['P_ID'])
@@ -222,7 +217,7 @@ if uploaded_files:
             st.subheader("🎯 Pitch Analysis (X & Y Distribution)")
             col_p1, col_p2 = st.columns(2)
             with col_p1:
-                st.markdown("**X-Pitch Analysis**")
+                st.markdown("**X-Pitch Analysis (Between Columns)**")
                 fig_px, ax_px = plt.subplots(figsize=(p_w/2, p_h))
                 sns.boxplot(data=combined_df, x='SOURCE_FILE', y='X_PITCH', hue='SOURCE_FILE', ax=ax_px, palette='Blues')
                 apply_global_legend(ax_px, global_legend_loc, show_legend); st.pyplot(fig_px)
@@ -232,7 +227,7 @@ if uploaded_files:
                 apply_global_legend(ax_hx, global_legend_loc, show_legend); st.pyplot(fig_hx)
 
             with col_p2:
-                st.markdown("**Y-Pitch Analysis**")
+                st.markdown("**Y-Pitch Analysis (Between Rows)**")
                 fig_py, ax_py = plt.subplots(figsize=(p_w/2, p_h))
                 sns.boxplot(data=combined_df, x='SOURCE_FILE', y='Y_PITCH', hue='SOURCE_FILE', ax=ax_py, palette='Reds')
                 apply_global_legend(ax_py, global_legend_loc, show_legend); st.pyplot(fig_py)
@@ -241,4 +236,4 @@ if uploaded_files:
                 sns.histplot(data=combined_df, x='Y_PITCH', hue='SOURCE_FILE', kde=True, ax=ax_hy)
                 apply_global_legend(ax_hy, global_legend_loc, show_legend); st.pyplot(fig_hy)
 else:
-    st.info("Upload CSV files to begin analysis.")
+    st.info("Please upload CSV files to begin analysis.")
