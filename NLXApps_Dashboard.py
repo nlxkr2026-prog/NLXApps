@@ -10,19 +10,30 @@ from io import BytesIO
 st.set_page_config(page_title="Bump Master Analyzer Pro", layout="wide")
 st.title("🔬 Universal Bump Quality Analyzer (v.Final_Fixed)")
 
-# --- 2. Sidebar Settings ---
+# --- 2. Sidebar Settings & File Upload ---
 st.sidebar.header("⚙️ Analysis & Visualization Settings")
 
-uploaded_files = st.sidebar.file_uploader("Upload all CSV files", type=['csv'], accept_multiple_files=True)
+# Session state key for resetting the file uploader (Remove All feature)
+if "file_uploader_key" not in st.session_state:
+    st.session_state["file_uploader_key"] = 0
+
+if st.sidebar.button("🗑️ Remove All Files"):
+    st.session_state["file_uploader_key"] += 1
+    st.rerun()
+
+uploaded_files = st.sidebar.file_uploader(
+    "Upload all CSV files", 
+    type=['csv'], 
+    accept_multiple_files=True,
+    key=st.session_state["file_uploader_key"]
+)
 
 if uploaded_files:
-    # [수정] Scale Factor 기본값을 1 (um)로 변경 (index=0)
     scale_factor = st.sidebar.selectbox("Scale Factor", [1, 1000], index=0, format_func=lambda x: "1 (um)" if x == 1 else "1000 (mm -> um)")
     z_gap_threshold = st.sidebar.slider("Z-Gap Layering Threshold (um)", 10, 500, 50)
     
     st.sidebar.divider()
     st.sidebar.subheader("🛡️ IQR Outlier Filtering")
-    # [수정] IQR 필터 기본값을 모두 체크 해제(False)로 변경
     use_filter_radius = st.sidebar.checkbox("Filter Radius (IQR)", value=False)
     use_filter_height = st.sidebar.checkbox("Filter Height (IQR)", value=False)
     use_filter_shift = st.sidebar.checkbox("Filter Shift (IQR)", value=False)
@@ -31,18 +42,15 @@ if uploaded_files:
     st.sidebar.subheader("📊 Visualization Options")
     layer_view_mode = st.sidebar.radio("Layer Display Mode", ["Layer All", "Split by Layer"])
     hist_layout = st.sidebar.selectbox("Histogram Layout", ["Facet (Split by File)", "Overlay"])
-    # [수정] Vector Scale 기본값을 5로 변경
     vector_scale = st.sidebar.slider("Vector Scale (Arrow Size)", 1, 200, 5)
 
     # --- 3. Logic Functions ---
-    
     def load_and_adapt(file_obj):
         df = pd.read_csv(file_obj)
         
         # Check for Multilayer Align data (presence of Pillar_Number)
         if 'Pillar_Number' in df.columns:
-            
-            # 1. Standardize coordinate column names (Keep Group_ID as is!)
+            # Standardize coordinate column names
             rename_map = {
                 'X_Coord': 'Bump_Center_X',
                 'Y_Coord': 'Bump_Center_Y',
@@ -50,7 +58,7 @@ if uploaded_files:
             }
             df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
             
-            # 2. Auto-calculate Shift data (Calculate based on Pillar_Number, not Group_ID!)
+            # Auto-calculate Shift data based on Pillar_Number
             if 'Layer_Number' in df.columns:
                 ref_df = df[df['Layer_Number'] == 0][['Pillar_Number', 'Bump_Center_X', 'Bump_Center_Y']]
                 ref_df = ref_df.rename(columns={'Bump_Center_X': 'Ref_X', 'Bump_Center_Y': 'Ref_Y'})
@@ -59,10 +67,9 @@ if uploaded_files:
                 df['Shift_X'] = df['Bump_Center_X'] - df['Ref_X']
                 df['Shift_Y'] = df['Bump_Center_Y'] - df['Ref_Y']
                 df['Shift_Norm'] = np.sqrt(df['Shift_X']**2 + df['Shift_Y']**2)
-                
                 df = df.drop(columns=['Ref_X', 'Ref_Y'])
             
-            # 3. Create dummy Height using Z coordinate if measuring value is absent (Prevent errors)
+            # Create dummy Height if absent
             if 'Height' not in df.columns and 'Bump_Center_Z' in df.columns:
                 df['Height'] = df['Bump_Center_Z']
                 
@@ -164,33 +171,41 @@ if uploaded_files:
             multi_df = pd.DataFrame()
             single_df = total_df.copy()
 
+        # Convert 0 to NaN in single_df for relevant columns to avoid skewed statistics for empty layers
+        zero_filter_cols = ['Radius', 'Height', 'Shift_Norm']
+        for c in zero_filter_cols:
+            if c in single_df.columns:
+                single_df[c] = single_df[c].replace(0, np.nan)
+
         # --- 5. Data Export & Summary View ---
         st.subheader("📁 Data Export & Summary Preview")
         output = BytesIO()
         
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
             
-            # [A] Single Layer Summary (Bump Shape & Shift)
+            # [A] Single Layer Summary
             if not single_df.empty:
                 st.markdown("#### 🟢 Bump Shape & Shift Summary")
                 s_list = [c for c in ['Radius', 'Height', 'Pitch_X', 'Pitch_Y', 'Shift_X', 'Shift_Y', 'Shift_Norm'] if c in single_df.columns]
                 if s_list:
                     s_summary_layer = single_df.groupby(['File_Name', 'Inferred_Layer'])[s_list].agg(['mean', 'std', 'count']).round(3)
+                    
+                    # Remove layers where count is 0
+                    counts_layer = s_summary_layer.xs('count', axis=1, level=1)
+                    s_summary_layer = s_summary_layer[counts_layer.sum(axis=1) > 0]
+                    
                     s_summary_total = single_df.groupby(['File_Name'])[s_list].agg(['mean', 'std', 'count']).round(3)
                     
                     st.dataframe(s_summary_layer, use_container_width=True)
-                    
-                    # Write to Excel
                     s_summary_layer.to_excel(writer, sheet_name='Bump_Layer_Stats')
                     s_summary_total.to_excel(writer, sheet_name='Bump_Total_Stats')
                     single_df.to_excel(writer, sheet_name='Bump_Raw_Data', index=False)
 
-            # [B] Multilayer Summary (Alignment)
+            # [B] Multilayer Summary
             if not multi_df.empty:
                 st.markdown("#### 🏢 Multilayer Alignment Summary")
                 st.caption("※ Note: In the table below, 'Height' refers to the Z-coordinate (elevation) of the layer, and 'Shift' refers to the relative misalignment from Layer 0.")
                 
-                # Rename columns temporarily for clarity
                 m_df_summary = multi_df.copy()
                 rename_dict = {
                     'Height': 'Layer_Z_Height(um)', 
@@ -204,13 +219,14 @@ if uploaded_files:
                 if m_list:
                     m_summary_layer = m_df_summary.groupby(['File_Name', 'Inferred_Layer'])[m_list].agg(['mean', 'std', 'count']).round(3)
                     
+                    # Remove layers where count is 0
+                    counts_m_layer = m_summary_layer.xs('count', axis=1, level=1)
+                    m_summary_layer = m_summary_layer[counts_m_layer.sum(axis=1) > 0]
+
                     st.dataframe(m_summary_layer, use_container_width=True)
-                    
-                    # Write to Excel
                     m_summary_layer.to_excel(writer, sheet_name='Align_Layer_Stats')
                     multi_df.to_excel(writer, sheet_name='Align_Raw_Data', index=False)
 
-        # Download Button
         st.download_button(label="📥 Download Excel Report", data=output.getvalue(), file_name="Bump_Quality_Report.xlsx", mime="application/vnd.ms-excel")
         st.divider()
 
@@ -236,7 +252,7 @@ if uploaded_files:
                         fig_heat = px.scatter(
                             m_a_df, x=xc_h, y=yc_h, color=sel_a, 
                             facet_col="Inferred_Layer", color_continuous_scale="Turbo",
-                            hover_data=['Group_ID'] # Tooltip
+                            hover_data=['Group_ID']
                         )
                         fig_heat.update_yaxes(scaleanchor="x", scaleratio=1)
                         st.plotly_chart(fig_heat, use_container_width=True, config=plot_config)
@@ -327,38 +343,15 @@ if uploaded_files:
             if not multi_df.empty:
                 st.markdown("Analyze how each Pillar is vertically aligned across different layers.")
 
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.subheader("📈 Vertical Shift Trend")
-                    trend_df = multi_df.groupby(['File_Name', 'Inferred_Layer'])[['Shift_X', 'Shift_Y', 'Shift_Norm']].mean().reset_index()
-                    fig_trend = go.Figure()
-                    for fname in trend_df['File_Name'].unique():
-                        f_df = trend_df[trend_df['File_Name'] == fname]
-                        fig_trend.add_trace(go.Scatter(x=f_df['Shift_X'], y=f_df['Inferred_Layer'], mode='lines+markers', name=f"{fname} (X)"))
-                        fig_trend.add_trace(go.Scatter(x=f_df['Shift_Y'], y=f_df['Inferred_Layer'], mode='lines+markers', name=f"{fname} (Y)"))
-                    fig_trend.update_layout(xaxis_title="Average Shift (um)", yaxis_title="Layer Number", height=600, title="Average Misalignment by Layer")
-                    st.plotly_chart(fig_trend, use_container_width=True, config=plot_config)
-
-                with c2:
-                    st.subheader("🌐 3D Shift Trajectory")
-                    p_list = multi_df['Pillar_Number'].unique()
-                    if len(p_list) > 200:
-                        samp_p = pd.Series(p_list).sample(200, random_state=42)
-                        plot_m_df = multi_df[multi_df['Pillar_Number'].isin(samp_p)]
-                        st.caption(f"⚠️ Sampled 200 out of {len(p_list)} total Pillars for visualization.")
-                    else:
-                        plot_m_df = multi_df
-
-                    fig_3d = px.line_3d(
-                        plot_m_df.sort_values(['Pillar_Number', 'Inferred_Layer']),
-                        x='Shift_X', y='Shift_Y', z='Inferred_Layer', 
-                        color='Pillar_Number',
-                        hover_data=['Group_ID', 'Shift_Norm'],
-                        title="Pillar Trajectory Relative to Layer 0"
-                    )
-                    fig_3d.update_traces(line=dict(width=4))
-                    fig_3d.update_layout(scene=dict(aspectmode='cube'), height=600, showlegend=False)
-                    st.plotly_chart(fig_3d, use_container_width=True, config=plot_config)
+                st.subheader("📈 Vertical Shift Trend")
+                trend_df = multi_df.groupby(['File_Name', 'Inferred_Layer'])[['Shift_X', 'Shift_Y', 'Shift_Norm']].mean().reset_index()
+                fig_trend = go.Figure()
+                for fname in trend_df['File_Name'].unique():
+                    f_df = trend_df[trend_df['File_Name'] == fname]
+                    fig_trend.add_trace(go.Scatter(x=f_df['Shift_X'], y=f_df['Inferred_Layer'], mode='lines+markers', name=f"{fname} (X)"))
+                    fig_trend.add_trace(go.Scatter(x=f_df['Shift_Y'], y=f_df['Inferred_Layer'], mode='lines+markers', name=f"{fname} (Y)"))
+                fig_trend.update_layout(xaxis_title="Average Shift (um)", yaxis_title="Layer Number", height=600, title="Average Misalignment by Layer")
+                st.plotly_chart(fig_trend, use_container_width=True, config=plot_config)
 
                 st.divider()
                 st.subheader("📍 Layer Alignment Vector Map")
@@ -392,10 +385,10 @@ if uploaded_files:
                 valid_groups = sorted(total_df['Group_ID'].dropna().unique())
                 
                 if valid_groups:
-                    # [수정] selectbox를 number_input (타이핑) 형식으로 변경
-                    target_id = st.number_input("Enter Bump ID (Group_ID)", min_value=int(min(valid_groups)), max_value=int(max(valid_groups)), value=int(valid_groups[0]), step=1)
+                    min_id = int(min(valid_groups))
+                    max_id = int(max(valid_groups))
+                    target_id = st.number_input(f"Enter Bump ID (Group_ID) [Available Range: {min_id} ~ {max_id}]", min_value=min_id, max_value=max_id, value=min_id, step=1)
                     
-                    # [수정] 입력한 ID가 유효한지 검사 후 결과 렌더링
                     if target_id in valid_groups:
                         bump_df = total_df[total_df['Group_ID'] == target_id].copy()
                         
@@ -407,19 +400,9 @@ if uploaded_files:
                         if view_cols:
                             pivot_view = bump_df.set_index(['Inferred_Layer', 'File_Name'])[view_cols].dropna(how='all', axis=1)
                             st.dataframe(pivot_view, use_container_width=True)
-                            
-                            if 'Pillar_Number' in bump_df.columns and bump_df['Pillar_Number'].notna().any():
-                                st.markdown("#### 🚀 Pillar 3D Trajectory")
-                                multi_bump = bump_df[bump_df['Pillar_Number'].notna()].sort_values('Inferred_Layer')
-                                
-                                fig_single_3d = px.line_3d(multi_bump, x='Shift_X', y='Shift_Y', z='Inferred_Layer', markers=True)
-                                fig_single_3d.update_traces(line=dict(width=5, color='red'), marker=dict(size=8, color='blue'))
-                                fig_single_3d.update_layout(scene=dict(aspectmode='cube'), height=500)
-                                st.plotly_chart(fig_single_3d, use_container_width=True, config=plot_config)
                         else:
                             st.info("No valid metrics found for this Bump ID.")
                     else:
-                        # [수정] 없는 Group_ID 입력 시 오류 메시지 출력
                         st.error(f"❌ Bump ID '{target_id}' does not exist in the uploaded data. Please enter a valid ID.")
                 else:
                     st.error("No integrated Group_ID data available.")
